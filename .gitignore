@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+
+# Generated experiment data and outputs
+preproc/
+outputs/
+manifests/
+density_stats/
