@@ -14,9 +14,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from cardiac_ensure.datasets import CardiacCineENSUREDataset
+from cardiac_ensure.datasets import CardiacCineENSUREDataset, StaticShiftSourceENSUREDataset
 from cardiac_ensure.models import TemporalNormUnet
-from cardiac_ensure.scripts.eval_metrics import mean_nmse, summarize_reconstruction_metrics
+from cardiac_ensure.scripts.eval_metrics import summarize_reconstruction_metrics, to_magnitude
 from cardiac_ensure.scripts.train_common import (
     RunningStats,
     configure_torch,
@@ -30,6 +30,7 @@ from cardiac_ensure.scripts.train_common import (
     select_frame_mode,
     set_random_seed,
 )
+from cardiac_ensure.ops import dynamic_a_forward
 """
  python /home/dengyipin/project/gsure-diffusion-mri/cardiac_ensure/scripts/train_supervised_baseline.py \
   --data-root /home/dengyipin/CMR2025/cmr001 \
@@ -63,15 +64,21 @@ from cardiac_ensure.scripts.train_common import (
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, default=None)
+    parser.add_argument("--manifest-csv", type=Path, default=None)
     parser.add_argument("--preproc-root", type=Path, default=None)
     parser.add_argument("--density-root", type=Path, default=None)
     parser.add_argument("--train-split", type=str, default="train")
     parser.add_argument("--val-split", type=str, default="val")
+    parser.add_argument("--source-role", type=str, default="source_train")
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--split-seed", type=int, default=7)
+    parser.add_argument("--allow-slice-val-fallback", action="store_true", default=True)
+    parser.add_argument("--no-allow-slice-val-fallback", dest="allow_slice_val_fallback", action="store_false")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--acceleration", type=float, default=4.0)
     parser.add_argument("--sigma-mask", type=float, default=0.18)
-    parser.add_argument("--window-size", type=int, default=5)
+    parser.add_argument("--window-size", type=int, default=1)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--window-mode", choices=("centered", "sliding"), default="centered")
     parser.add_argument("--frame-mode", choices=("all", "center"), default="all")
@@ -84,23 +91,60 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--chans", type=int, default=64)
     parser.add_argument("--num-pools", type=int, default=4)
-    parser.add_argument("--num-unrolls", type=int, default=3)
+    parser.add_argument("--num-unrolls", type=int, default=12)
     parser.add_argument("--drop-prob", type=float, default=0.0)
     parser.add_argument("--no-residual", action="store_true")
+    parser.add_argument("--supervised-loss-weight", type=float, default=1.0)
+    parser.add_argument("--self-loss-weight", type=float, default=1.0)
+    parser.add_argument("--self-loss", action="store_true", default=True)
+    parser.add_argument("--no-self-loss", dest="self_loss", action="store_false")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--include-ssim", action="store_true")
-    parser.add_argument("--train-deterministic-masks", action="store_true")
-    parser.add_argument("--val-deterministic-masks", action="store_true")
+    parser.add_argument("--train-deterministic-masks", dest="train_deterministic_masks", action="store_true", default=True)
+    parser.add_argument("--no-train-deterministic-masks", dest="train_deterministic_masks", action="store_false")
+    parser.add_argument("--val-deterministic-masks", dest="val_deterministic_masks", action="store_true", default=True)
+    parser.add_argument("--no-val-deterministic-masks", dest="val_deterministic_masks", action="store_false")
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--max-val-batches", type=int, default=None)
     parser.add_argument("--crop-height", type=int, default=None)
     parser.add_argument("--crop-width", type=int, default=None)
+    parser.add_argument("--require-preproc", action="store_true")
     return parser
 
 
-def _make_dataset(args: argparse.Namespace, split: str, deterministic_masks: bool) -> CardiacCineENSUREDataset:
+def _using_shift_manifest(args: argparse.Namespace) -> bool:
+    return args.manifest_csv is not None
+
+
+def _make_dataset(
+    args: argparse.Namespace,
+    split: str,
+    deterministic_masks: bool,
+):
+    if _using_shift_manifest(args):
+        subset = "train" if split == args.train_split else "val"
+        return StaticShiftSourceENSUREDataset(
+            manifest_csv=args.manifest_csv,
+            subset=subset,
+            preproc_root=args.preproc_root,
+            density_root=args.density_root,
+            source_role=args.source_role,
+            val_fraction=args.val_fraction,
+            split_seed=args.split_seed,
+            allow_slice_val_fallback=args.allow_slice_val_fallback,
+            acceleration=args.acceleration,
+            sigma_mask=args.sigma_mask,
+            window_size=args.window_size,
+            deterministic_masks=deterministic_masks,
+            mask_seed=args.seed,
+            return_target=True,
+            require_preproc=args.require_preproc,
+        )
+
+    if args.data_root is None:
+        raise ValueError("Either --data-root or --manifest-csv is required.")
     return CardiacCineENSUREDataset(
         root=args.data_root,
         split=split,
@@ -119,7 +163,7 @@ def _make_dataset(args: argparse.Namespace, split: str, deterministic_masks: boo
 
 
 def _make_loader(
-    dataset: CardiacCineENSUREDataset,
+    dataset,
     args: argparse.Namespace,
     shuffle: bool,
 ) -> DataLoader:
@@ -133,18 +177,61 @@ def _make_loader(
     )
 
 
+class NormalizedL1Loss(torch.nn.Module):
+    def forward(self, reference: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
+        return torch.norm(prediction - reference, p=1) / torch.clamp(torch.norm(reference.detach(), p=1), min=1e-8)
+
+
+def _center_crop_to_shape(x: torch.Tensor, spatial_shape: tuple[int, int]) -> torch.Tensor:
+    target_h, target_w = int(spatial_shape[0]), int(spatial_shape[1])
+    if x.shape[-2] < target_h or x.shape[-1] < target_w:
+        raise ValueError(
+            f"Cannot center-crop tensor with spatial shape {tuple(x.shape[-2:])} to larger target {spatial_shape}"
+        )
+    h_start = (x.shape[-2] - target_h) // 2
+    w_start = (x.shape[-1] - target_w) // 2
+    return x[..., h_start : h_start + target_h, w_start : w_start + target_w]
+
+
+def _align_prediction_to_target(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if prediction.shape[-2:] == target.shape[-2:]:
+        return prediction
+    return _center_crop_to_shape(prediction, tuple(int(v) for v in target.shape[-2:]))
+
+
+def _normalized_kspace_l1(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    return torch.sum(torch.abs(prediction - target)) / torch.clamp(torch.sum(torch.abs(target.detach())), min=eps)
+
+
 def _forward_supervised_loss(
     model: TemporalNormUnet,
     batch: Dict[str, Any],
     frame_mode: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
     if "target_rss" not in batch:
         raise KeyError("Supervised training requires target_rss from the dataset.")
-    prediction = model(batch["zf"], maps=batch.get("maps"), mask=batch.get("mask"))
-    prediction = select_frame_mode(prediction, frame_mode)
+    prediction_full = model(batch["zf"], maps=batch.get("maps"), mask=batch.get("mask"))
+    target = batch["target_rss"]
+    prediction_for_target = _align_prediction_to_target(prediction_full, target)
+    prediction = select_frame_mode(to_magnitude(prediction_for_target), frame_mode)
     target = select_frame_mode(batch["target_rss"], frame_mode)
-    loss = mean_nmse(prediction, target)
-    return prediction, target, loss
+    loss_fn = NormalizedL1Loss()
+    supervised_loss = loss_fn(target, prediction)
+
+    if batch.get("maps") is not None and batch.get("mask") is not None and "kspace_us" in batch:
+        kspace_prediction = dynamic_a_forward(prediction_full, batch["maps"], batch["mask"])
+        self_loss = _normalized_kspace_l1(kspace_prediction, batch["kspace_us"])
+    else:
+        self_loss = prediction_full.new_tensor(0.0)
+
+    return prediction, target, {
+        "supervised_loss": supervised_loss,
+        "self_loss": self_loss,
+    }
 
 
 def train_one_epoch(
@@ -167,7 +254,10 @@ def train_one_epoch(
         batch = maybe_center_crop_batch(batch, crop_height=args.crop_height, crop_width=args.crop_width)
         observed_target_in_train = observed_target_in_train or ("target_rss" in batch)
 
-        _, _, loss = _forward_supervised_loss(model, batch, args.frame_mode)
+        _, _, loss_dict = _forward_supervised_loss(model, batch, args.frame_mode)
+        supervised_loss = loss_dict["supervised_loss"]
+        self_loss = loss_dict["self_loss"] if args.self_loss else supervised_loss.new_tensor(0.0)
+        loss = float(args.supervised_loss_weight) * supervised_loss + float(args.self_loss_weight) * self_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -176,10 +266,20 @@ def train_one_epoch(
         optimizer.step()
 
         loss_value = float(loss.detach())
-        stats.update({"loss": loss_value})
+        supervised_loss_value = float(supervised_loss.detach())
+        self_loss_value = float(self_loss.detach())
+        stats.update(
+            {
+                "loss": loss_value,
+                "supervised_loss": supervised_loss_value,
+                "self_loss": self_loss_value,
+            }
+        )
         progress.set_postfix(
             loss=f"{loss_value:.6f}",
             avg_loss=f"{stats.totals['loss'] / stats.count:.6f}",
+            sup=f"{supervised_loss_value:.6f}",
+            ssl=f"{self_loss_value:.6f}",
             refresh=False,
         )
 
@@ -206,6 +306,7 @@ def validate(
             batch = move_to_device(batch, device)
             batch = maybe_center_crop_batch(batch, crop_height=args.crop_height, crop_width=args.crop_width)
             prediction = model(batch["zf"], maps=batch.get("maps"), mask=batch.get("mask"))
+            prediction = _align_prediction_to_target(prediction, batch["target_rss"])
             prediction = select_frame_mode(prediction, args.frame_mode)
             target = select_frame_mode(batch["target_rss"], args.frame_mode)
             metrics = summarize_reconstruction_metrics(
@@ -231,6 +332,9 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
     device = resolve_device(args.device)
     output_dir = ensure_dir(args.output_dir)
 
+    if _using_shift_manifest(args) and args.window_size != 1:
+        raise ValueError("Shift manifest supervised+self training currently requires --window-size 1")
+
     train_dataset = _make_dataset(args, args.train_split, args.train_deterministic_masks)
     val_dataset = _make_dataset(args, args.val_split, args.val_deterministic_masks)
     train_loader = _make_loader(train_dataset, args, shuffle=True)
@@ -249,10 +353,20 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
 
     config = vars(args).copy()
     config["device"] = str(device)
+    config["training_objective"] = "normalized_l1_supervised_plus_measured_kspace_self_supervision"
+    config["uses_shift_manifest"] = bool(_using_shift_manifest(args))
     config["train_dataset_len"] = len(train_dataset)
     config["val_dataset_len"] = len(val_dataset)
     config["num_parameters"] = count_trainable_parameters(model)
     save_json(output_dir / "config.json", config)
+    if _using_shift_manifest(args):
+        save_json(
+            output_dir / "source_split.json",
+            {
+                "train": train_dataset.split_summary(),
+                "val": val_dataset.split_summary(),
+            },
+        )
 
     history: list[Dict[str, Any]] = []
     best_val_nmse = float("inf")
@@ -264,6 +378,8 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         epoch_record = {
             "epoch": epoch_idx,
             "train_loss": train_stats["loss"],
+            "train_supervised_loss": train_stats["supervised_loss"],
+            "train_self_loss": train_stats["self_loss"],
             "val_nmse": val_stats["nmse"],
             "val_nrmse": val_stats["nrmse"],
             "val_psnr": val_stats["psnr"],
@@ -277,8 +393,10 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         history.append(epoch_record)
 
         print(
-            f"[supervised] epoch={epoch_idx} "
+            f"[supervised+self] epoch={epoch_idx} "
             f"train_loss={epoch_record['train_loss']:.6f} "
+            f"sup={epoch_record['train_supervised_loss']:.6f} "
+            f"self={epoch_record['train_self_loss']:.6f} "
             f"val_nmse={epoch_record['val_nmse']:.6f} "
             f"val_psnr={epoch_record['val_psnr']:.3f}"
         )
@@ -312,6 +430,9 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         "best_val_nmse": best_val_nmse,
         "history": history,
         "output_dir": str(output_dir),
+        "training_objective": config["training_objective"],
+        "supervised_loss_weight": float(args.supervised_loss_weight),
+        "self_loss_weight": float(args.self_loss_weight if args.self_loss else 0.0),
         "train_dataset_returns_target": bool(train_dataset.return_target),
         "val_dataset_returns_target": bool(val_dataset.return_target),
     }
