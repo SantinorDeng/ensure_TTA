@@ -102,6 +102,7 @@ METRICS_FIELDS = [
     "best_step",
     "self_val_best",
     "runtime_sec",
+    "adapt_runtime_sec",
     "norm_scale",
     "recon_npz",
     "curve_json",
@@ -127,6 +128,7 @@ SUMMARY_FIELDS = [
     "after_tta_ssim_std",
     "delta_ssim_mean",
     "runtime_sec_per_slice",
+    "adapt_runtime_sec_per_slice",
     "tta_trigger_rate",
     "negative_adaptation_rate",
 ]
@@ -145,6 +147,7 @@ class SelfSupervisedTTAResult:
     early_stop_step: int | None
     self_val_best: float
     runtime_sec: float
+    adapt_runtime_sec: float
     best_step: int | None
     num_trainable_params: int
 
@@ -299,6 +302,11 @@ def _as_float(value: torch.Tensor | float | int) -> float:
     return float(value)
 
 
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def _count_trainable(parameters: list[torch.nn.Parameter]) -> int:
     return int(sum(param.numel() for param in parameters if param.requires_grad))
 
@@ -445,6 +453,7 @@ def run_self_supervised_tta(
             early_stop_step=None,
             self_val_best=float("nan"),
             runtime_sec=runtime,
+            adapt_runtime_sec=0.0,
             best_step=None,
             num_trainable_params=0,
         )
@@ -468,8 +477,11 @@ def run_self_supervised_tta(
     best_val_loss = float("inf")
     best_step: int | None = None
     early_stop_step: int | None = None
+    adapt_runtime_sec = 0.0
 
     for step_idx in range(int(max_steps)):
+        _sync_if_cuda(device)
+        step_tic = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         prediction = model_tta(train_zf, maps=maps, mask=train_mask)
         train_prediction = dynamic_a_forward(prediction, maps, train_mask)
@@ -491,13 +503,32 @@ def run_self_supervised_tta(
                 kspace=kspace,
                 maps=maps,
             )
-            full_prediction_kspace = dynamic_a_forward(val_prediction, maps, mask)
-            dc_residual = _normalized_complex_l1(full_prediction_kspace, _masked_kspace(kspace, mask))
 
         train_loss_value = _as_float(loss)
         val_loss_value = _as_float(val_loss)
         train_losses.append(train_loss_value)
         self_val_losses.append(val_loss_value)
+
+        if np.isfinite(val_loss_value) and val_loss_value < best_val_loss:
+            best_val_loss = val_loss_value
+            best_step = step_idx + 1
+            best_state = _clone_state_dict(model_tta)
+
+        should_stop = False
+        if int(early_stop_window) > 0 and step_idx + 1 > 3 * int(early_stop_window):
+            window = int(early_stop_window)
+            curr = float(np.mean(self_val_losses[-window:]))
+            prev = float(np.mean(self_val_losses[-2 * window : -window]))
+            if np.isfinite(curr) and np.isfinite(prev) and curr > prev:
+                early_stop_step = step_idx + 1
+                should_stop = True
+
+        _sync_if_cuda(device)
+        adapt_runtime_sec += time.perf_counter() - step_tic
+
+        with torch.no_grad():
+            full_prediction_kspace = dynamic_a_forward(val_prediction, maps, mask)
+            dc_residual = _normalized_complex_l1(full_prediction_kspace, _masked_kspace(kspace, mask))
 
         dc_min, dc_max = _dc_weight_stats(model_tta)
         log_row: dict[str, float | int | None] = {
@@ -516,18 +547,8 @@ def run_self_supervised_tta(
                 log_row["score_if_gt_available_ssim"] = float(metrics_step["ssim"])
         step_logs.append(log_row)
 
-        if np.isfinite(val_loss_value) and val_loss_value < best_val_loss:
-            best_val_loss = val_loss_value
-            best_step = step_idx + 1
-            best_state = _clone_state_dict(model_tta)
-
-        if int(early_stop_window) > 0 and step_idx + 1 > 3 * int(early_stop_window):
-            window = int(early_stop_window)
-            curr = float(np.mean(self_val_losses[-window:]))
-            prev = float(np.mean(self_val_losses[-2 * window : -window]))
-            if np.isfinite(curr) and np.isfinite(prev) and curr > prev:
-                early_stop_step = step_idx + 1
-                break
+        if should_stop:
+            break
 
     model_tta.eval()
     if best_step is not None:
@@ -550,6 +571,7 @@ def run_self_supervised_tta(
         early_stop_step=early_stop_step,
         self_val_best=best_val_loss if self_val_losses else float("nan"),
         runtime_sec=runtime,
+        adapt_runtime_sec=adapt_runtime_sec,
         best_step=best_step,
         num_trainable_params=num_trainable_params,
     )
@@ -633,6 +655,7 @@ def metric_row_base(
         "best_step": "",
         "self_val_best": "",
         "runtime_sec": "",
+        "adapt_runtime_sec": "",
         "norm_scale": "",
         "recon_npz": "",
         "curve_json": "",
@@ -647,6 +670,7 @@ def populate_result_fields(row: dict[str, object], result: SelfSupervisedTTAResu
     row["best_step"] = result.best_step if result.best_step is not None else ""
     row["self_val_best"] = result.self_val_best
     row["runtime_sec"] = result.runtime_sec
+    row["adapt_runtime_sec"] = result.adapt_runtime_sec
     row["norm_scale"] = meta.get("norm_scale", "")
 
     for metric in METRIC_NAMES:
@@ -677,6 +701,7 @@ def save_curve(path: Path, result: SelfSupervisedTTAResult) -> None:
             "best_step": result.best_step,
             "early_stop_step": result.early_stop_step,
             "self_val_best": result.self_val_best,
+            "adapt_runtime_sec": result.adapt_runtime_sec,
             "num_trainable_params": result.num_trainable_params,
             "tta_loss": "simple_measured_kspace_l1",
         },
@@ -717,6 +742,7 @@ def save_reconstruction_npz(
             "num_tta_steps",
             "best_step",
             "runtime_sec",
+            "adapt_runtime_sec",
         )
     }
     np.savez_compressed(
@@ -766,6 +792,7 @@ def aggregate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         after_ssim = [value for value in (finite(row, "after_tta_ssim") for row in group) if value is not None]
         delta_ssim = [value for value in (finite(row, "delta_ssim") for row in group) if value is not None]
         runtime = [value for value in (finite(row, "runtime_sec") for row in group) if value is not None]
+        adapt_runtime = [value for value in (finite(row, "adapt_runtime_sec") for row in group) if value is not None]
         trigger_flags = [
             bool(str(row.get("run_tta")).lower() == "true" and (finite(row, "num_tta_steps") or 0.0) > 0.0)
             for row in group
@@ -785,6 +812,7 @@ def aggregate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         after_ssim_mean, after_ssim_std = mean_std(after_ssim)
         delta_ssim_mean, _ = mean_std(delta_ssim)
         runtime_mean, _ = mean_std(runtime)
+        adapt_runtime_mean, _ = mean_std(adapt_runtime)
         summaries.append(
             {
                 "method": method,
@@ -806,6 +834,7 @@ def aggregate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
                 "after_tta_ssim_std": after_ssim_std,
                 "delta_ssim_mean": delta_ssim_mean,
                 "runtime_sec_per_slice": runtime_mean,
+                "adapt_runtime_sec_per_slice": adapt_runtime_mean,
                 "tta_trigger_rate": float(np.mean(trigger_flags)) if trigger_flags else float("nan"),
                 "negative_adaptation_rate": float(np.mean(neg_flags)) if neg_flags else float("nan"),
             }
@@ -937,6 +966,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "update_mode": args.update_mode,
         "include_ssim": args.include_ssim,
         "save_recons": args.save_recons,
+        "adapt_runtime_sec_definition": (
+            "CUDA-synchronized time spent in the per-step TTA update and self-validation early-stop path; "
+            "excludes before/after metrics, SSIM/GT step metrics, diagnostic logging, curve logging, and reconstruction saving."
+        ),
         "metrics_csv": str(metrics_path),
         "summary_csv": str(summary_path),
     }

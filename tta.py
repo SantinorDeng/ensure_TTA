@@ -31,6 +31,7 @@ class ENSURETTAResult:
     early_stop_step: int | None
     self_val_best: float
     runtime_sec: float
+    adapt_runtime_sec: float
     best_step: int | None
     num_trainable_params: int
 
@@ -51,6 +52,11 @@ def _as_float(value: torch.Tensor | float | int) -> float:
     if torch.is_tensor(value):
         return float(value.detach().cpu().real.item())
     return float(value)
+
+
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _prediction_np(prediction: torch.Tensor) -> np.ndarray:
@@ -250,10 +256,13 @@ def run_true_ensure_tta(
     divergence_mc_samples: int = 1,
     divergence_mode: str = "measurement",
     project_divergence: bool = True,
+    tta_loss: str = "ensure",
 ) -> ENSURETTAResult:
     tic = time.time()
     if update_mode != "all_params":
         raise NotImplementedError("v1 cardiac ENSURE TTA only supports update_mode='all_params'")
+    if tta_loss not in ("ensure", "self_supervised"):
+        raise ValueError(f"Unsupported tta_loss={tta_loss!r}; choose 'ensure' or 'self_supervised'")
 
     kspace = batch["kspace_us"]
     zf = batch["zf"]
@@ -285,6 +294,7 @@ def run_true_ensure_tta(
             early_stop_step=None,
             self_val_best=float("nan"),
             runtime_sec=runtime,
+            adapt_runtime_sec=0.0,
             best_step=None,
             num_trainable_params=0,
         )
@@ -308,26 +318,43 @@ def run_true_ensure_tta(
     best_val_loss = float("inf")
     best_step: int | None = None
     early_stop_step: int | None = None
+    adapt_runtime_sec = 0.0
 
     for step_idx in range(int(max_steps)):
+        _sync_if_cuda(device)
+        step_tic = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        loss_dict = _true_ensure_loss_on_mask(
-            model_tta,
-            zf_input=train_zf,
-            kspace=train_kspace,
-            maps=maps,
-            mask=train_mask,
-            noise_sigma2=noise_sigma2,
-            density_weight=density_weight,
-            cg_l2lam=cg_l2lam,
-            cg_max_iter=cg_max_iter,
-            cg_tol=cg_tol,
-            divergence_eps=divergence_eps,
-            divergence_mc_samples=divergence_mc_samples,
-            divergence_mode=divergence_mode,
-            project_divergence=project_divergence,
-        )
-        loss = loss_dict["loss"]
+        if tta_loss == "ensure":
+            loss_dict = _true_ensure_loss_on_mask(
+                model_tta,
+                zf_input=train_zf,
+                kspace=train_kspace,
+                maps=maps,
+                mask=train_mask,
+                noise_sigma2=noise_sigma2,
+                density_weight=density_weight,
+                cg_l2lam=cg_l2lam,
+                cg_max_iter=cg_max_iter,
+                cg_tol=cg_tol,
+                divergence_eps=divergence_eps,
+                divergence_mc_samples=divergence_mc_samples,
+                divergence_mode=divergence_mode,
+                project_divergence=project_divergence,
+            )
+            loss = loss_dict["loss"]
+        else:
+            prediction = model_tta(train_zf, maps=maps, mask=train_mask)
+            train_prediction = dynamic_a_forward(prediction, maps, train_mask)
+            loss = _normalized_complex_l1(train_prediction, train_kspace)
+            loss_dict = {
+                "loss": loss,
+                "data_term": loss.detach(),
+                "div_term": torch.zeros((), device=loss.device, dtype=loss.real.dtype),
+                "div_scale": torch.zeros((), device=loss.device, dtype=loss.real.dtype),
+                "div_contribution": torch.zeros((), device=loss.device, dtype=loss.real.dtype),
+                "risk_proxy": loss.detach(),
+                "divergence_eps": torch.zeros((), device=loss.device, dtype=loss.real.dtype),
+            }
         if not torch.isfinite(loss.detach()):
             raise FloatingPointError(f"Non-finite TTA loss at step {step_idx + 1}: {float(loss.detach())}")
 
@@ -351,6 +378,23 @@ def run_true_ensure_tta(
         train_losses.append(train_loss_value)
         self_val_losses.append(val_loss_value)
 
+        if np.isfinite(val_loss_value) and val_loss_value < best_val_loss:
+            best_val_loss = val_loss_value
+            best_step = step_idx + 1
+            best_state = _clone_state_dict(model_tta)
+
+        should_stop = False
+        if int(early_stop_window) > 0 and step_idx + 1 > 3 * int(early_stop_window):
+            window = int(early_stop_window)
+            curr = float(np.mean(self_val_losses[-window:]))
+            prev = float(np.mean(self_val_losses[-2 * window : -window]))
+            if np.isfinite(curr) and np.isfinite(prev) and curr > prev:
+                early_stop_step = step_idx + 1
+                should_stop = True
+
+        _sync_if_cuda(device)
+        adapt_runtime_sec += time.perf_counter() - step_tic
+
         dc_min, dc_max = _dc_weight_stats(model_tta)
         log_row: dict[str, float | int | None] = {
             "step": step_idx + 1,
@@ -373,18 +417,8 @@ def run_true_ensure_tta(
                 log_row["score_if_gt_available_ssim"] = float(metrics_step["ssim"])
         step_logs.append(log_row)
 
-        if np.isfinite(val_loss_value) and val_loss_value < best_val_loss:
-            best_val_loss = val_loss_value
-            best_step = step_idx + 1
-            best_state = _clone_state_dict(model_tta)
-
-        if int(early_stop_window) > 0 and step_idx + 1 > 3 * int(early_stop_window):
-            window = int(early_stop_window)
-            curr = float(np.mean(self_val_losses[-window:]))
-            prev = float(np.mean(self_val_losses[-2 * window : -window]))
-            if np.isfinite(curr) and np.isfinite(prev) and curr > prev:
-                early_stop_step = step_idx + 1
-                break
+        if should_stop:
+            break
 
     model_tta.eval()
     if best_step is not None:
@@ -407,6 +441,7 @@ def run_true_ensure_tta(
         early_stop_step=early_stop_step,
         self_val_best=best_val_loss if self_val_losses else float("nan"),
         runtime_sec=runtime,
+        adapt_runtime_sec=adapt_runtime_sec,
         best_step=best_step,
         num_trainable_params=num_trainable_params,
     )

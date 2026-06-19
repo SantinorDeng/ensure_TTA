@@ -98,6 +98,7 @@ METRICS_FIELDS = [
     "best_step",
     "self_val_best",
     "runtime_sec",
+    "adapt_runtime_sec",
     "norm_scale",
     "recon_npz",
     "curve_json",
@@ -123,6 +124,7 @@ SUMMARY_FIELDS = [
     "after_tta_ssim_std",
     "delta_ssim_mean",
     "runtime_sec_per_slice",
+    "adapt_runtime_sec_per_slice",
     "tta_trigger_rate",
     "negative_adaptation_rate",
 ]
@@ -145,6 +147,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--self-val-fraction", type=float, default=0.05)
     parser.add_argument("--early-stop-window", type=int, default=20)
     parser.add_argument("--update-mode", default="all_params", choices=("all_params", "adapter"))
+    parser.add_argument(
+        "--tta-loss",
+        default="ensure",
+        choices=("ensure", "self_supervised"),
+        help="Loss used for TTA updates: TRUE-ENSURE or measured-kspace normalized L1.",
+    )
     parser.add_argument("--run-tta", dest="run_tta", action="store_true", default=True)
     parser.add_argument("--no-run-tta", dest="run_tta", action="store_false")
     parser.add_argument("--include-ssim", action="store_true")
@@ -295,6 +303,7 @@ def metric_row_base(
         "best_step": "",
         "self_val_best": "",
         "runtime_sec": "",
+        "adapt_runtime_sec": "",
         "norm_scale": "",
         "recon_npz": "",
         "curve_json": "",
@@ -309,6 +318,7 @@ def populate_result_fields(row: dict[str, object], result: ENSURETTAResult, meta
     row["best_step"] = result.best_step if result.best_step is not None else ""
     row["self_val_best"] = result.self_val_best
     row["runtime_sec"] = result.runtime_sec
+    row["adapt_runtime_sec"] = result.adapt_runtime_sec
     row["norm_scale"] = meta.get("norm_scale", "")
 
     for metric in METRIC_NAMES:
@@ -339,6 +349,7 @@ def save_curve(path: Path, result: ENSURETTAResult) -> None:
             "best_step": result.best_step,
             "early_stop_step": result.early_stop_step,
             "self_val_best": result.self_val_best,
+            "adapt_runtime_sec": result.adapt_runtime_sec,
             "num_trainable_params": result.num_trainable_params,
         },
     )
@@ -371,6 +382,7 @@ def save_reconstruction_npz(
             "num_tta_steps",
             "best_step",
             "runtime_sec",
+            "adapt_runtime_sec",
         )
     }
     np.savez_compressed(
@@ -420,6 +432,7 @@ def aggregate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         after_ssim = [value for value in (finite(row, "after_tta_ssim") for row in group) if value is not None]
         delta_ssim = [value for value in (finite(row, "delta_ssim") for row in group) if value is not None]
         runtime = [value for value in (finite(row, "runtime_sec") for row in group) if value is not None]
+        adapt_runtime = [value for value in (finite(row, "adapt_runtime_sec") for row in group) if value is not None]
         trigger_flags = [
             bool(str(row.get("run_tta")).lower() == "true" and (finite(row, "num_tta_steps") or 0.0) > 0.0)
             for row in group
@@ -439,6 +452,7 @@ def aggregate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         after_ssim_mean, after_ssim_std = mean_std(after_ssim)
         delta_ssim_mean, _ = mean_std(delta_ssim)
         runtime_mean, _ = mean_std(runtime)
+        adapt_runtime_mean, _ = mean_std(adapt_runtime)
         summaries.append(
             {
                 "method": method,
@@ -460,6 +474,7 @@ def aggregate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
                 "after_tta_ssim_std": after_ssim_std,
                 "delta_ssim_mean": delta_ssim_mean,
                 "runtime_sec_per_slice": runtime_mean,
+                "adapt_runtime_sec_per_slice": adapt_runtime_mean,
                 "tta_trigger_rate": float(np.mean(trigger_flags)) if trigger_flags else float("nan"),
                 "negative_adaptation_rate": float(np.mean(neg_flags)) if neg_flags else float("nan"),
             }
@@ -487,7 +502,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         drop_last=False,
     )
     max_samples = len(dataset) if args.max_samples is None else min(int(args.max_samples), len(dataset))
-    method = "true_ensure_tta" if args.run_tta else "true_ensure_frozen"
+    if args.run_tta:
+        method = "true_ensure_tta" if args.tta_loss == "ensure" else "true_ensure_self_supervised_tta"
+    else:
+        method = "true_ensure_frozen"
 
     crop_height = args.crop_height if args.crop_height is not None else checkpoint_config.get("crop_height")
     crop_width = args.crop_width if args.crop_width is not None else checkpoint_config.get("crop_width")
@@ -497,6 +515,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     print(f"Device: {device}", flush=True)
     print(f"Checkpoint: {args.checkpoint}", flush=True)
     print(f"Manifest: {args.manifest_csv} split_role={args.split_role} rows={max_samples}", flush=True)
+    print(f"TTA loss: {args.tta_loss}", flush=True)
 
     progress = tqdm(enumerate(loader), total=max_samples, desc=method)
     for sample_idx, batch in progress:
@@ -536,6 +555,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 divergence_mc_samples=int(_config_value(checkpoint_config, "divergence_mc_samples", 1)),
                 divergence_mode=str(_config_value(checkpoint_config, "divergence_mode", "measurement")),
                 project_divergence=not bool(_config_value(checkpoint_config, "no_divergence_projection", False)),
+                tta_loss=args.tta_loss,
             )
             populate_result_fields(row, result, meta)
             if args.save_curves and args.run_tta:
@@ -581,6 +601,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "device": str(device),
         "split_role": args.split_role,
         "method": method,
+        "tta_loss": args.tta_loss,
+        "uses_ensure_loss": args.tta_loss == "ensure",
         "num_dataset_rows": len(dataset),
         "num_requested_rows": max_samples,
         "num_metric_rows": len(rows),
@@ -595,6 +617,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "update_mode": args.update_mode,
         "include_ssim": args.include_ssim,
         "save_recons": args.save_recons,
+        "adapt_runtime_sec_definition": (
+            "CUDA-synchronized time spent in the per-step TTA update and self-validation early-stop path; "
+            "excludes before/after metrics, SSIM/GT step metrics, curve logging, and reconstruction saving."
+        ),
         "metrics_csv": str(metrics_path),
         "summary_csv": str(summary_path),
     }
