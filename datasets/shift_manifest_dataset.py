@@ -294,6 +294,22 @@ def _read_static_target(handle: h5py.File, row: Mapping[str, str], slice_id: int
     return target[None, None, ...].astype(np.float32)
 
 
+def _complex_noise_for_snr(
+    kspace: np.ndarray,
+    *,
+    snr_db: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, float]:
+    signal_power = float(np.mean(np.abs(kspace) ** 2))
+    if not np.isfinite(signal_power) or signal_power <= 0.0:
+        return np.zeros_like(kspace, dtype=np.complex64), 0.0
+    noise_sigma2 = signal_power / (10.0 ** (float(snr_db) / 10.0))
+    component_std = float(np.sqrt(noise_sigma2 / 2.0))
+    real = rng.normal(loc=0.0, scale=component_std, size=kspace.shape).astype(np.float32)
+    imag = rng.normal(loc=0.0, scale=component_std, size=kspace.shape).astype(np.float32)
+    return (real + 1j * imag).astype(np.complex64, copy=False), float(noise_sigma2)
+
+
 class StaticShiftSourceENSUREDataset(Dataset):
     """Return static source-domain samples from shift manifests."""
 
@@ -317,9 +333,15 @@ class StaticShiftSourceENSUREDataset(Dataset):
         return_target: bool = True,
         require_preproc: bool = False,
         cache_maps: bool = True,
+        test_noise_snr_db: float | None = None,
+        test_noise_seed: int = 0,
     ) -> None:
         if int(window_size) != 1:
             raise ValueError("StaticShiftSourceENSUREDataset is source-static and currently requires window_size=1")
+        if test_noise_snr_db is not None and (
+            not np.isfinite(float(test_noise_snr_db)) or float(test_noise_snr_db) <= 0.0
+        ):
+            raise ValueError(f"test_noise_snr_db must be positive when provided, got {test_noise_snr_db}")
         self.manifest_csv = Path(manifest_csv)
         self.subset = subset
         self.preproc_root = Path(preproc_root) if preproc_root is not None else None
@@ -338,6 +360,8 @@ class StaticShiftSourceENSUREDataset(Dataset):
         self.return_target = bool(return_target)
         self.require_preproc = bool(require_preproc)
         self.cache_maps = bool(cache_maps)
+        self.test_noise_snr_db = None if test_noise_snr_db is None else float(test_noise_snr_db)
+        self.test_noise_seed = int(test_noise_seed)
         self._map_cache: Dict[Tuple[Path, int], np.ndarray] = {}
         self._density_cache: Dict[Tuple[int, int, float, float], Dict[str, np.ndarray]] = {}
 
@@ -479,6 +503,16 @@ class StaticShiftSourceENSUREDataset(Dataset):
             return np.random.default_rng(seed)
         return np.random.default_rng()
 
+    def _rng_for_test_noise(self, sample: StaticShiftSample) -> np.random.Generator:
+        seed = stable_seed(
+            self.test_noise_seed,
+            sample.sample_id,
+            sample.volume_id,
+            sample.slice_id,
+            "test_noise",
+        )
+        return np.random.default_rng(seed)
+
     def __getitem__(self, idx: int) -> Mapping[str, object]:
         sample = self.samples[int(idx)]
         preproc_maps, scale, noise_sigma2, meta_from_preproc, preproc_processed = self._read_preproc_values(sample)
@@ -496,6 +530,16 @@ class StaticShiftSourceENSUREDataset(Dataset):
 
         if self.normalize:
             kspace_fs = kspace_fs / max(float(scale), EPS)
+
+        input_noise_sigma2 = 0.0
+        if self.test_noise_snr_db is not None:
+            noise, input_noise_sigma2 = _complex_noise_for_snr(
+                kspace_fs,
+                snr_db=self.test_noise_snr_db,
+                rng=self._rng_for_test_noise(sample),
+            )
+            kspace_fs = (kspace_fs + noise).astype(np.complex64, copy=False)
+            noise_sigma2 = float(noise_sigma2) + float(input_noise_sigma2)
 
         density_stats = self._get_density_stats(sample.height, sample.width)
         if "density_line_prob" in density_stats:
@@ -534,6 +578,11 @@ class StaticShiftSourceENSUREDataset(Dataset):
             "acceleration": float(self.acceleration),
             "sigma_mask": float(self.sigma_mask),
             "window_size": int(self.window_size),
+            "input_noise_enabled": self.test_noise_snr_db is not None,
+            "input_noise_snr_db": float(self.test_noise_snr_db) if self.test_noise_snr_db is not None else float("nan"),
+            "input_noise_sigma2": float(input_noise_sigma2),
+            "noise_sigma2_total": float(noise_sigma2),
+            "input_noise_seed": int(self.test_noise_seed),
         }
         meta.update(meta_from_preproc)
         if "density_stats_path" in density_stats:

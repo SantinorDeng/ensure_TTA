@@ -315,10 +315,47 @@ def run_true_ensure_tta(
     self_val_losses: list[float] = []
     step_logs: list[dict[str, float | int | None]] = []
     best_state = _clone_state_dict(model_tta)
-    best_val_loss = float("inf")
-    best_step: int | None = None
+    best_step: int | None = 0
     early_stop_step: int | None = None
     adapt_runtime_sec = 0.0
+
+    _sync_if_cuda(device)
+    initial_val_tic = time.perf_counter()
+    with torch.no_grad():
+        initial_val_loss, initial_val_prediction = _self_validation_loss(
+            model_tta,
+            train_zf=train_zf,
+            train_mask=train_mask,
+            val_mask=val_mask,
+            kspace=kspace,
+            maps=maps,
+        )
+    initial_val_loss_value = _as_float(initial_val_loss)
+    best_val_loss = initial_val_loss_value if np.isfinite(initial_val_loss_value) else float("inf")
+    _sync_if_cuda(device)
+    adapt_runtime_sec += time.perf_counter() - initial_val_tic
+
+    dc_min, dc_max = _dc_weight_stats(model_tta)
+    initial_log: dict[str, float | int | None] = {
+        "step": 0,
+        "train_loss": None,
+        "self_val_loss": initial_val_loss_value,
+        "data_term": None,
+        "div_term": None,
+        "div_scale": None,
+        "div_contribution": None,
+        "risk_proxy": None,
+        "divergence_eps": None,
+        "dc_weight_min": dc_min,
+        "dc_weight_max": dc_max,
+    }
+    if target is not None:
+        metrics_step = _compute_metrics(initial_val_prediction, target, include_ssim=include_ssim)
+        if "nmse" in metrics_step:
+            initial_log["score_if_gt_available_nmse"] = float(metrics_step["nmse"])
+        if "ssim" in metrics_step:
+            initial_log["score_if_gt_available_ssim"] = float(metrics_step["ssim"])
+    step_logs.append(initial_log)
 
     for step_idx in range(int(max_steps)):
         _sync_if_cuda(device)
@@ -439,7 +476,7 @@ def run_true_ensure_tta(
         step_logs=step_logs,
         num_tta_steps=len(train_losses),
         early_stop_step=early_stop_step,
-        self_val_best=best_val_loss if self_val_losses else float("nan"),
+        self_val_best=best_val_loss,
         runtime_sec=runtime,
         adapt_runtime_sec=adapt_runtime_sec,
         best_step=best_step,

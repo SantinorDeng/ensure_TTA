@@ -100,6 +100,9 @@ METRICS_FIELDS = [
     "runtime_sec",
     "adapt_runtime_sec",
     "norm_scale",
+    "input_noise_snr_db",
+    "input_noise_sigma2",
+    "noise_sigma2_total",
     "recon_npz",
     "curve_json",
     "error",
@@ -140,6 +143,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--test-noise-snr-db", type=float, default=None)
+    parser.add_argument("--test-noise-seed", type=int, default=9007)
     parser.add_argument("--tta-steps", type=int, default=250)
     parser.add_argument("--tta-lr", type=float, default=1.0e-5)
     parser.add_argument("--tta-weight-decay", type=float, default=0.0)
@@ -222,6 +227,8 @@ def make_dataset(args: argparse.Namespace, config: Mapping[str, Any]) -> StaticS
         mask_seed=int(args.seed),
         return_target=True,
         require_preproc=bool(_config_value(config, "require_preproc", False)),
+        test_noise_snr_db=args.test_noise_snr_db,
+        test_noise_seed=int(args.test_noise_seed),
     )
 
 
@@ -305,6 +312,9 @@ def metric_row_base(
         "runtime_sec": "",
         "adapt_runtime_sec": "",
         "norm_scale": "",
+        "input_noise_snr_db": "",
+        "input_noise_sigma2": "",
+        "noise_sigma2_total": "",
         "recon_npz": "",
         "curve_json": "",
         "error": error,
@@ -320,6 +330,9 @@ def populate_result_fields(row: dict[str, object], result: ENSURETTAResult, meta
     row["runtime_sec"] = result.runtime_sec
     row["adapt_runtime_sec"] = result.adapt_runtime_sec
     row["norm_scale"] = meta.get("norm_scale", "")
+    row["input_noise_snr_db"] = meta.get("input_noise_snr_db", "")
+    row["input_noise_sigma2"] = meta.get("input_noise_sigma2", "")
+    row["noise_sigma2_total"] = meta.get("noise_sigma2_total", "")
 
     for metric in METRIC_NAMES:
         before = result.before_metrics.get(metric)
@@ -383,6 +396,9 @@ def save_reconstruction_npz(
             "best_step",
             "runtime_sec",
             "adapt_runtime_sec",
+            "input_noise_snr_db",
+            "input_noise_sigma2",
+            "noise_sigma2_total",
         )
     }
     np.savez_compressed(
@@ -516,6 +532,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     print(f"Checkpoint: {args.checkpoint}", flush=True)
     print(f"Manifest: {args.manifest_csv} split_role={args.split_role} rows={max_samples}", flush=True)
     print(f"TTA loss: {args.tta_loss}", flush=True)
+    print(f"Test noise SNR dB: {args.test_noise_snr_db}", flush=True)
 
     progress = tqdm(enumerate(loader), total=max_samples, desc=method)
     for sample_idx, batch in progress:
@@ -617,6 +634,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "update_mode": args.update_mode,
         "include_ssim": args.include_ssim,
         "save_recons": args.save_recons,
+        "test_noise_snr_db": args.test_noise_snr_db,
+        "test_noise_seed": args.test_noise_seed,
+        "test_noise_domain": "normalized_full_kspace_before_sampling",
+        "test_noise_target": "kspace_fs_only_target_rss_left_clean",
         "adapt_runtime_sec_definition": (
             "CUDA-synchronized time spent in the per-step TTA update and self-validation early-stop path; "
             "excludes before/after metrics, SSIM/GT step metrics, curve logging, and reconstruction saving."
