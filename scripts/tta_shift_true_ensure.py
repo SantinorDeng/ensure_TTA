@@ -155,8 +155,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tta-loss",
         default="ensure",
-        choices=("ensure", "self_supervised"),
-        help="Loss used for TTA updates: TRUE-ENSURE or measured-kspace normalized L1.",
+        choices=("ensure", "ensure_data", "self_supervised"),
+        help="Loss used for TTA updates: full TRUE-ENSURE, TRUE-ENSURE data term only, or measured-kspace normalized L1.",
     )
     parser.add_argument("--run-tta", dest="run_tta", action="store_true", default=True)
     parser.add_argument("--no-run-tta", dest="run_tta", action="store_false")
@@ -519,7 +519,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     )
     max_samples = len(dataset) if args.max_samples is None else min(int(args.max_samples), len(dataset))
     if args.run_tta:
-        method = "true_ensure_tta" if args.tta_loss == "ensure" else "true_ensure_self_supervised_tta"
+        method_by_loss = {
+            "ensure": "true_ensure_tta",
+            "ensure_data": "true_ensure_data_tta",
+            "self_supervised": "true_ensure_self_supervised_tta",
+        }
+        method = method_by_loss[args.tta_loss]
     else:
         method = "true_ensure_frozen"
 
@@ -619,7 +624,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "split_role": args.split_role,
         "method": method,
         "tta_loss": args.tta_loss,
-        "uses_ensure_loss": args.tta_loss == "ensure",
+        "uses_ensure_loss": args.tta_loss in ("ensure", "ensure_data"),
+        "uses_ensure_divergence": args.tta_loss == "ensure",
         "num_dataset_rows": len(dataset),
         "num_requested_rows": max_samples,
         "num_metric_rows": len(rows),

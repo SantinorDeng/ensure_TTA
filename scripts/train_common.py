@@ -126,6 +126,52 @@ def count_trainable_parameters(model: torch.nn.Module) -> int:
     return int(sum(param.numel() for param in model.parameters() if param.requires_grad))
 
 
+def _finite_mean(value: Any) -> float | None:
+    if torch.is_tensor(value):
+        tensor = value.detach().float()
+        finite = torch.isfinite(tensor)
+        if not bool(finite.any()):
+            return None
+        return float(tensor[finite].mean().cpu())
+    if isinstance(value, (list, tuple)):
+        vals = []
+        for item in value:
+            mean = _finite_mean(item)
+            if mean is not None:
+                vals.append(mean)
+        if not vals:
+            return None
+        return float(sum(vals) / len(vals))
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (float, int)):
+        tensor = torch.tensor(float(value), dtype=torch.float32)
+        if bool(torch.isfinite(tensor)):
+            return float(tensor)
+    return None
+
+
+def input_noise_stats_from_batch(batch: Mapping[str, Any], prefix: str) -> Dict[str, float]:
+    meta = batch.get("meta", {}) if isinstance(batch, Mapping) else {}
+    if not isinstance(meta, Mapping):
+        return {}
+
+    fields = {
+        "input_noise_enabled": "enabled",
+        "input_noise_snr_db": "snr_db",
+        "input_noise_sigma2": "sigma2",
+        "noise_sigma2_total": "sigma2_total",
+    }
+    out: Dict[str, float] = {}
+    for meta_key, suffix in fields.items():
+        if meta_key not in meta:
+            continue
+        mean = _finite_mean(meta[meta_key])
+        if mean is not None:
+            out[f"{prefix}_{suffix}"] = mean
+    return out
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,

@@ -2,7 +2,7 @@
 set -eu
 
 if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 {acc_ensure|acc_traditional|mod_ensure|mod_traditional}" >&2
+    echo "Usage: $0 {acc_ensure|acc_traditional|mod_ensure|mod_traditional|acc_ensure_train_noise|acc_traditional_train_noise|mod_ensure_train_noise|mod_traditional_train_noise}" >&2
     exit 2
 fi
 
@@ -10,6 +10,7 @@ ROOT="/home/hulabdl/Deng_proj/cardiac_ensure"
 EXP="$1"
 NOISE_SNR_DB="${NOISE_SNR_DB:-20}"
 NOISE_SEED="${NOISE_SEED:-9007}"
+TRAIN_NOISE_TAG="${TRAIN_NOISE_TAG:-train_noise_snr15_25_val20_seed7007}"
 TTA_STEPS="${TTA_STEPS:-250}"
 TTA_LR="${TTA_LR:-1e-5}"
 SELF_VAL_FRACTION="${SELF_VAL_FRACTION:-0.05}"
@@ -48,6 +49,38 @@ case "$EXP" in
         CHECKPOINT="$ROOT/outputs/shifts/main/modality_shift/uncertainty_joint_source_r4_w1_unroll12_seed7/best.pt"
         MANIFEST="$ROOT/manifests/shifts/main/modality_shift.csv"
         OUTPUT_DIR="$ROOT/outputs/tta/shifts/main/modality_shift/uncertainty_joint_source_r4_w1_unroll12_seed7_noise_snr${NOISE_TAG}"
+        EXTRA_ARGS=""
+        ;;
+    acc_ensure_train_noise)
+        DEVICE="${DEVICE:-cuda:4}"
+        SCRIPT="$ROOT/scripts/tta_shift_true_ensure.py"
+        CHECKPOINT="$ROOT/outputs/shifts/main/acceleration_shift/true_ensure_source_r4_w1_auto_unroll_seed7_${TRAIN_NOISE_TAG}/best.pt"
+        MANIFEST="$ROOT/manifests/shifts/main/acceleration_shift.csv"
+        OUTPUT_DIR="$ROOT/outputs/tta/shifts/main/acceleration_shift/true_ensure_source_r4_w1_auto_unroll_seed7_${TRAIN_NOISE_TAG}_noise_snr${NOISE_TAG}"
+        EXTRA_ARGS="--tta-loss ensure"
+        ;;
+    acc_traditional_train_noise)
+        DEVICE="${DEVICE:-cuda:5}"
+        SCRIPT="$ROOT/scripts/tta_shift_supervised_baseline.py"
+        CHECKPOINT="$ROOT/outputs/shifts/main/acceleration_shift/uncertainty_joint_source_r4_w1_unroll12_seed7_${TRAIN_NOISE_TAG}/best.pt"
+        MANIFEST="$ROOT/manifests/shifts/main/acceleration_shift.csv"
+        OUTPUT_DIR="$ROOT/outputs/tta/shifts/main/acceleration_shift/uncertainty_joint_source_r4_w1_unroll12_seed7_${TRAIN_NOISE_TAG}_noise_snr${NOISE_TAG}"
+        EXTRA_ARGS=""
+        ;;
+    mod_ensure_train_noise)
+        DEVICE="${DEVICE:-cuda:6}"
+        SCRIPT="$ROOT/scripts/tta_shift_true_ensure.py"
+        CHECKPOINT="$ROOT/outputs/shifts/main/modality_shift/true_ensure_source_r4_w1_auto_unroll_seed7_${TRAIN_NOISE_TAG}/best.pt"
+        MANIFEST="$ROOT/manifests/shifts/main/modality_shift.csv"
+        OUTPUT_DIR="$ROOT/outputs/tta/shifts/main/modality_shift/true_ensure_source_r4_w1_auto_unroll_seed7_${TRAIN_NOISE_TAG}_noise_snr${NOISE_TAG}"
+        EXTRA_ARGS="--tta-loss ensure"
+        ;;
+    mod_traditional_train_noise)
+        DEVICE="${DEVICE:-cuda:7}"
+        SCRIPT="$ROOT/scripts/tta_shift_supervised_baseline.py"
+        CHECKPOINT="$ROOT/outputs/shifts/main/modality_shift/uncertainty_joint_source_r4_w1_unroll12_seed7_${TRAIN_NOISE_TAG}/best.pt"
+        MANIFEST="$ROOT/manifests/shifts/main/modality_shift.csv"
+        OUTPUT_DIR="$ROOT/outputs/tta/shifts/main/modality_shift/uncertainty_joint_source_r4_w1_unroll12_seed7_${TRAIN_NOISE_TAG}_noise_snr${NOISE_TAG}"
         EXTRA_ARGS=""
         ;;
     *)

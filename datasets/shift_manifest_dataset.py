@@ -310,6 +310,15 @@ def _complex_noise_for_snr(
     return (real + 1j * imag).astype(np.complex64, copy=False), float(noise_sigma2)
 
 
+def _validate_positive_snr(value: float | None, name: str) -> float | None:
+    if value is None:
+        return None
+    out = float(value)
+    if not np.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{name} must be positive when provided, got {value}")
+    return out
+
+
 class StaticShiftSourceENSUREDataset(Dataset):
     """Return static source-domain samples from shift manifests."""
 
@@ -333,15 +342,37 @@ class StaticShiftSourceENSUREDataset(Dataset):
         return_target: bool = True,
         require_preproc: bool = False,
         cache_maps: bool = True,
+        input_noise_snr_db: float | None = None,
+        input_noise_snr_db_min: float | None = None,
+        input_noise_snr_db_max: float | None = None,
+        input_noise_seed: int = 0,
         test_noise_snr_db: float | None = None,
         test_noise_seed: int = 0,
     ) -> None:
         if int(window_size) != 1:
             raise ValueError("StaticShiftSourceENSUREDataset is source-static and currently requires window_size=1")
-        if test_noise_snr_db is not None and (
-            not np.isfinite(float(test_noise_snr_db)) or float(test_noise_snr_db) <= 0.0
-        ):
-            raise ValueError(f"test_noise_snr_db must be positive when provided, got {test_noise_snr_db}")
+        explicit_input_noise = any(
+            value is not None
+            for value in (input_noise_snr_db, input_noise_snr_db_min, input_noise_snr_db_max)
+        )
+        if explicit_input_noise and test_noise_snr_db is not None:
+            raise ValueError("Use either input_noise_* or test_noise_snr_db, not both.")
+
+        fixed_snr = _validate_positive_snr(input_noise_snr_db, "input_noise_snr_db")
+        min_snr = _validate_positive_snr(input_noise_snr_db_min, "input_noise_snr_db_min")
+        max_snr = _validate_positive_snr(input_noise_snr_db_max, "input_noise_snr_db_max")
+        if (min_snr is None) != (max_snr is None):
+            raise ValueError("input_noise_snr_db_min and input_noise_snr_db_max must be provided together.")
+        if fixed_snr is not None and min_snr is not None:
+            raise ValueError("Use either fixed input_noise_snr_db or an input_noise_snr_db_min/max range, not both.")
+        if min_snr is not None and max_snr is not None and min_snr > max_snr:
+            raise ValueError(
+                f"input_noise_snr_db_min must be <= input_noise_snr_db_max, got {min_snr} > {max_snr}"
+            )
+        test_snr = _validate_positive_snr(test_noise_snr_db, "test_noise_snr_db")
+        if test_snr is not None:
+            fixed_snr = test_snr
+            input_noise_seed = int(test_noise_seed)
         self.manifest_csv = Path(manifest_csv)
         self.subset = subset
         self.preproc_root = Path(preproc_root) if preproc_root is not None else None
@@ -360,8 +391,13 @@ class StaticShiftSourceENSUREDataset(Dataset):
         self.return_target = bool(return_target)
         self.require_preproc = bool(require_preproc)
         self.cache_maps = bool(cache_maps)
-        self.test_noise_snr_db = None if test_noise_snr_db is None else float(test_noise_snr_db)
-        self.test_noise_seed = int(test_noise_seed)
+        self.input_noise_snr_db = fixed_snr
+        self.input_noise_snr_db_min = min_snr
+        self.input_noise_snr_db_max = max_snr
+        self.input_noise_seed = int(input_noise_seed)
+        self.input_noise_epoch = 0
+        self._input_noise_seed_token = "test_noise" if test_snr is not None else "input_noise"
+        self._input_noise_include_epoch = test_snr is None
         self._map_cache: Dict[Tuple[Path, int], np.ndarray] = {}
         self._density_cache: Dict[Tuple[int, int, float, float], Dict[str, np.ndarray]] = {}
 
@@ -383,6 +419,9 @@ class StaticShiftSourceENSUREDataset(Dataset):
         self._all_source_rows = source_rows
         self._split_summary = split_summary
         self.samples = [self._row_to_sample(row) for row in selected_rows]
+
+    def set_noise_epoch(self, epoch: int) -> None:
+        self.input_noise_epoch = int(epoch)
 
     def _row_to_sample(self, row: Dict[str, str]) -> StaticShiftSample:
         height, width = shape_from_manifest_row(row)
@@ -419,6 +458,11 @@ class StaticShiftSourceENSUREDataset(Dataset):
                 "manifest_sha256": manifest_sha256(self.manifest_csv),
                 "source_role": self.source_role,
                 "dataset_len": len(self),
+                "input_noise_snr_db": self.input_noise_snr_db,
+                "input_noise_snr_db_min": self.input_noise_snr_db_min,
+                "input_noise_snr_db_max": self.input_noise_snr_db_max,
+                "input_noise_seed": int(self.input_noise_seed),
+                "input_noise_epoch": int(self.input_noise_epoch),
             }
         )
         return out
@@ -503,15 +547,25 @@ class StaticShiftSourceENSUREDataset(Dataset):
             return np.random.default_rng(seed)
         return np.random.default_rng()
 
-    def _rng_for_test_noise(self, sample: StaticShiftSample) -> np.random.Generator:
-        seed = stable_seed(
-            self.test_noise_seed,
+    def _rng_for_input_noise(self, sample: StaticShiftSample) -> np.random.Generator:
+        seed_parts: list[object] = [
+            self.input_noise_seed,
             sample.sample_id,
             sample.volume_id,
             sample.slice_id,
-            "test_noise",
-        )
+            self._input_noise_seed_token,
+        ]
+        if self._input_noise_include_epoch:
+            seed_parts.append(self.input_noise_epoch)
+        seed = stable_seed(*seed_parts)
         return np.random.default_rng(seed)
+
+    def _sample_input_noise_snr(self, rng: np.random.Generator) -> float | None:
+        if self.input_noise_snr_db is not None:
+            return float(self.input_noise_snr_db)
+        if self.input_noise_snr_db_min is not None and self.input_noise_snr_db_max is not None:
+            return float(rng.uniform(self.input_noise_snr_db_min, self.input_noise_snr_db_max))
+        return None
 
     def __getitem__(self, idx: int) -> Mapping[str, object]:
         sample = self.samples[int(idx)]
@@ -532,11 +586,15 @@ class StaticShiftSourceENSUREDataset(Dataset):
             kspace_fs = kspace_fs / max(float(scale), EPS)
 
         input_noise_sigma2 = 0.0
-        if self.test_noise_snr_db is not None:
+        input_noise_snr_db = float("nan")
+        rng_noise = self._rng_for_input_noise(sample)
+        sampled_snr_db = self._sample_input_noise_snr(rng_noise)
+        if sampled_snr_db is not None:
+            input_noise_snr_db = float(sampled_snr_db)
             noise, input_noise_sigma2 = _complex_noise_for_snr(
                 kspace_fs,
-                snr_db=self.test_noise_snr_db,
-                rng=self._rng_for_test_noise(sample),
+                snr_db=sampled_snr_db,
+                rng=rng_noise,
             )
             kspace_fs = (kspace_fs + noise).astype(np.complex64, copy=False)
             noise_sigma2 = float(noise_sigma2) + float(input_noise_sigma2)
@@ -578,11 +636,18 @@ class StaticShiftSourceENSUREDataset(Dataset):
             "acceleration": float(self.acceleration),
             "sigma_mask": float(self.sigma_mask),
             "window_size": int(self.window_size),
-            "input_noise_enabled": self.test_noise_snr_db is not None,
-            "input_noise_snr_db": float(self.test_noise_snr_db) if self.test_noise_snr_db is not None else float("nan"),
+            "input_noise_enabled": sampled_snr_db is not None,
+            "input_noise_snr_db": input_noise_snr_db,
+            "input_noise_snr_db_min": (
+                float(self.input_noise_snr_db_min) if self.input_noise_snr_db_min is not None else float("nan")
+            ),
+            "input_noise_snr_db_max": (
+                float(self.input_noise_snr_db_max) if self.input_noise_snr_db_max is not None else float("nan")
+            ),
             "input_noise_sigma2": float(input_noise_sigma2),
             "noise_sigma2_total": float(noise_sigma2),
-            "input_noise_seed": int(self.test_noise_seed),
+            "input_noise_seed": int(self.input_noise_seed),
+            "input_noise_epoch": int(self.input_noise_epoch),
         }
         meta.update(meta_from_preproc)
         if "density_stats_path" in density_stats:
@@ -621,6 +686,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--sigma-mask", type=float, default=0.18)
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--no-target", action="store_true")
+    parser.add_argument("--input-noise-snr-db", type=float, default=None)
+    parser.add_argument("--input-noise-snr-db-min", type=float, default=None)
+    parser.add_argument("--input-noise-snr-db-max", type=float, default=None)
+    parser.add_argument("--input-noise-seed", type=int, default=0)
+    parser.add_argument("--input-noise-epoch", type=int, default=0)
     return parser
 
 
@@ -638,7 +708,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         acceleration=args.acceleration,
         sigma_mask=args.sigma_mask,
         return_target=not args.no_target,
+        input_noise_snr_db=args.input_noise_snr_db,
+        input_noise_snr_db_min=args.input_noise_snr_db_min,
+        input_noise_snr_db_max=args.input_noise_snr_db_max,
+        input_noise_seed=args.input_noise_seed,
     )
+    dataset.set_noise_epoch(args.input_noise_epoch)
     sample = dataset[args.index]
     print(json.dumps(dataset.split_summary(), indent=2))
     for key, value in sample.items():

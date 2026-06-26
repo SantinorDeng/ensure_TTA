@@ -184,6 +184,7 @@ def select_middle_rows(
     *,
     target_count: int,
     slices_per_volume: int,
+    volume_offset: int = 0,
 ) -> List[Dict[str, object]]:
     by_volume: Dict[str, List[Mapping[str, object]]] = {}
     for row in sorted(rows, key=lambda item: (str(item["path"]), int(item["slice_idx"]))):
@@ -191,7 +192,11 @@ def select_middle_rows(
 
     selected: List[Dict[str, object]] = []
     selected_ids: set[str] = set()
-    for volume_rows in by_volume.values():
+    volume_groups = list(by_volume.values())
+    if volume_groups:
+        offset = int(volume_offset) % len(volume_groups)
+        volume_groups = volume_groups[offset:] + volume_groups[:offset]
+    for volume_rows in volume_groups:
         num_slices = int(volume_rows[0]["num_slices"])
         allowed = middle_slice_indices(num_slices, slices_per_volume)
         for row in volume_rows:
@@ -244,6 +249,7 @@ def shift_rows_for_role(
     split_role: str,
     target_count: int,
     slices_per_volume: int,
+    volume_offset: int,
     mask_shape: tuple[int, int],
     mask_acceleration: float,
 ) -> List[Dict[str, object]]:
@@ -252,8 +258,15 @@ def shift_rows_for_role(
         spec["source_nominal_acceleration"] if split_role == "source_train" else spec["target_nominal_acceleration"]
     )
     matches = [row for row in base_rows if row_matches(row, role_filter)]
-    selected = select_middle_rows(matches, target_count=target_count, slices_per_volume=slices_per_volume)
+    selected = select_middle_rows(
+        matches,
+        target_count=target_count,
+        slices_per_volume=slices_per_volume,
+        volume_offset=volume_offset,
+    )
     selection_rule = "middle slice only" if slices_per_volume == 1 else f"middle {slices_per_volume} slices"
+    if volume_offset:
+        selection_rule = f"{selection_rule}, volume offset {int(volume_offset)}"
 
     role_rows: List[Dict[str, object]] = []
     for rank, row in enumerate(selected):
@@ -292,12 +305,18 @@ def build_shift_manifests(
     input_manifest_root: Path,
     output_dir: Path,
     tiers: Sequence[str],
+    shifts: Sequence[str],
+    tier_output_name: str | None,
+    source_volume_offset: int,
+    target_volume_offset: int,
 ) -> Dict[str, object]:
     dataset_rows = build_dataset_rows(input_manifest_root)
     summary: Dict[str, object] = {}
     for tier_name in tiers:
         tier = TIERS[tier_name]
-        for shift_name, spec in SHIFT_SPECS.items():
+        output_tier = tier_output_name or tier_name
+        for shift_name in shifts:
+            spec = SHIFT_SPECS[shift_name]
             mask_shape, mask_acceleration = mask_metadata(spec["eval_mask_path"])
             source_rows = shift_rows_for_role(
                 base_rows=dataset_rows,
@@ -307,6 +326,7 @@ def build_shift_manifests(
                 split_role="source_train",
                 target_count=tier["source_slices"],
                 slices_per_volume=tier["slices_per_volume"],
+                volume_offset=source_volume_offset,
                 mask_shape=mask_shape,
                 mask_acceleration=mask_acceleration,
             )
@@ -318,13 +338,14 @@ def build_shift_manifests(
                 split_role="target_test",
                 target_count=tier["target_slices"],
                 slices_per_volume=tier["slices_per_volume"],
+                volume_offset=target_volume_offset,
                 mask_shape=mask_shape,
                 mask_acceleration=mask_acceleration,
             )
             rows = source_rows + target_rows
-            path = output_dir / "shifts" / tier_name / f"{shift_name}.csv"
+            path = output_dir / "shifts" / output_tier / f"{shift_name}.csv"
             write_csv(path, rows, fields=SHIFT_FIELDS)
-            summary[f"{tier_name}/{shift_name}"] = {
+            summary[f"{output_tier}/{shift_name}"] = {
                 "path": str(path),
                 "source_train_rows": len(source_rows),
                 "target_test_rows": len(target_rows),
@@ -334,7 +355,7 @@ def build_shift_manifests(
                 "eval_mask_actual_acceleration": mask_acceleration,
                 "selection_rule": rows[0]["selection_rule"] if rows else "",
             }
-            print(f"[ok] {tier_name}/{shift_name}: source_train={len(source_rows)} target_test={len(target_rows)}")
+            print(f"[ok] {output_tier}/{shift_name}: source_train={len(source_rows)} target_test={len(target_rows)}")
     write_csv(output_dir / "summary.csv", [{"key": key, **value} for key, value in summary.items()], fields=["key", "path", "source_train_rows", "target_test_rows", "source_domain", "target_domain", "eval_mask_shape", "eval_mask_actual_acceleration", "selection_rule"])
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return summary
@@ -345,6 +366,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--input-manifest-root", type=Path, default=UTTA_ROOT / "manifests")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "manifests")
     parser.add_argument("--tiers", nargs="+", choices=sorted(TIERS), default=list(TIERS))
+    parser.add_argument("--shifts", nargs="+", choices=sorted(SHIFT_SPECS), default=list(SHIFT_SPECS))
+    parser.add_argument(
+        "--tier-output-name",
+        default=None,
+        help="Directory name under output-dir/shifts. CSV experiment_tier values still use --tiers.",
+    )
+    parser.add_argument("--source-volume-offset", type=int, default=0)
+    parser.add_argument("--target-volume-offset", type=int, default=0)
     return parser
 
 
@@ -354,6 +383,10 @@ def main(argv: list[str] | None = None) -> int:
         input_manifest_root=args.input_manifest_root,
         output_dir=args.output_dir,
         tiers=args.tiers,
+        shifts=args.shifts,
+        tier_output_name=args.tier_output_name,
+        source_volume_offset=args.source_volume_offset,
+        target_volume_offset=args.target_volume_offset,
     )
     return 0
 

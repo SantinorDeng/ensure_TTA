@@ -22,6 +22,7 @@ from cardiac_ensure.scripts.train_common import (
     configure_torch,
     count_trainable_parameters,
     ensure_dir,
+    input_noise_stats_from_batch,
     maybe_center_crop_batch,
     move_to_device,
     resolve_device,
@@ -106,6 +107,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--no-train-deterministic-masks", dest="train_deterministic_masks", action="store_false")
     parser.add_argument("--val-deterministic-masks", dest="val_deterministic_masks", action="store_true", default=True)
     parser.add_argument("--no-val-deterministic-masks", dest="val_deterministic_masks", action="store_false")
+    parser.add_argument("--train-noise-snr-db-min", type=float, default=None)
+    parser.add_argument("--train-noise-snr-db-max", type=float, default=None)
+    parser.add_argument("--train-noise-seed", type=int, default=7007)
+    parser.add_argument("--val-noise-snr-db", type=float, default=None)
+    parser.add_argument("--val-noise-seed", type=int, default=8007)
+    parser.add_argument("--best-val-metric", choices=("val_nmse", "noisy_nmse"), default="val_nmse")
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--max-val-batches", type=int, default=None)
     parser.add_argument("--crop-height", type=int, default=None)
@@ -118,6 +125,17 @@ def _using_shift_manifest(args: argparse.Namespace) -> bool:
     return args.manifest_csv is not None
 
 
+def _noise_args_enabled(args: argparse.Namespace) -> bool:
+    return any(
+        value is not None
+        for value in (
+            args.train_noise_snr_db_min,
+            args.train_noise_snr_db_max,
+            args.val_noise_snr_db,
+        )
+    )
+
+
 def _make_dataset(
     args: argparse.Namespace,
     split: str,
@@ -125,6 +143,17 @@ def _make_dataset(
 ):
     if _using_shift_manifest(args):
         subset = "train" if split == args.train_split else "val"
+        if subset == "train":
+            noise_kwargs = {
+                "input_noise_snr_db_min": args.train_noise_snr_db_min,
+                "input_noise_snr_db_max": args.train_noise_snr_db_max,
+                "input_noise_seed": args.train_noise_seed,
+            }
+        else:
+            noise_kwargs = {
+                "input_noise_snr_db": args.val_noise_snr_db,
+                "input_noise_seed": args.val_noise_seed,
+            }
         return StaticShiftSourceENSUREDataset(
             manifest_csv=args.manifest_csv,
             subset=subset,
@@ -141,10 +170,13 @@ def _make_dataset(
             mask_seed=args.seed,
             return_target=True,
             require_preproc=args.require_preproc,
+            **noise_kwargs,
         )
 
     if args.data_root is None:
         raise ValueError("Either --data-root or --manifest-csv is required.")
+    if _noise_args_enabled(args):
+        raise ValueError("Noise-aware training arguments currently require --manifest-csv.")
     return CardiacCineENSUREDataset(
         root=args.data_root,
         split=split,
@@ -243,6 +275,7 @@ def train_one_epoch(
 ) -> Dict[str, float]:
     model.train()
     stats = RunningStats()
+    noise_stats = RunningStats()
     observed_target_in_train = False
 
     progress = tqdm(loader, desc="train", leave=False)
@@ -253,6 +286,9 @@ def train_one_epoch(
         batch = move_to_device(batch, device)
         batch = maybe_center_crop_batch(batch, crop_height=args.crop_height, crop_width=args.crop_width)
         observed_target_in_train = observed_target_in_train or ("target_rss" in batch)
+        batch_noise_stats = input_noise_stats_from_batch(batch, "train_input_noise")
+        if batch_noise_stats:
+            noise_stats.update(batch_noise_stats)
 
         _, _, loss_dict = _forward_supervised_loss(model, batch, args.frame_mode)
         supervised_loss = loss_dict["supervised_loss"]
@@ -284,6 +320,7 @@ def train_one_epoch(
         )
 
     out = stats.averages()
+    out.update(noise_stats.averages())
     out["num_steps"] = stats.count
     out["observed_target_in_train"] = float(observed_target_in_train)
     return out
@@ -297,6 +334,7 @@ def validate(
 ) -> Dict[str, float]:
     model.eval()
     stats = RunningStats()
+    noise_stats = RunningStats()
 
     with torch.no_grad():
         progress = tqdm(loader, desc="val", leave=False)
@@ -305,6 +343,9 @@ def validate(
                 break
             batch = move_to_device(batch, device)
             batch = maybe_center_crop_batch(batch, crop_height=args.crop_height, crop_width=args.crop_width)
+            batch_noise_stats = input_noise_stats_from_batch(batch, "val_input_noise")
+            if batch_noise_stats:
+                noise_stats.update(batch_noise_stats)
             prediction = model(batch["zf"], maps=batch.get("maps"), mask=batch.get("mask"))
             prediction = _align_prediction_to_target(prediction, batch["target_rss"])
             prediction = select_frame_mode(prediction, args.frame_mode)
@@ -322,11 +363,15 @@ def validate(
             )
 
     out = stats.averages()
+    out.update(noise_stats.averages())
     out["num_batches"] = stats.count
     return out
 
 
 def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.best_val_metric == "noisy_nmse" and args.val_noise_snr_db is None:
+        raise ValueError("--best-val-metric noisy_nmse requires --val-noise-snr-db.")
+
     configure_torch()
     set_random_seed(args.seed)
     device = resolve_device(args.device)
@@ -370,10 +415,14 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
 
     history: list[Dict[str, Any]] = []
     best_val_nmse = float("inf")
+    best_val_score = float("inf")
 
     for epoch_idx in range(args.epochs):
+        if hasattr(train_dataset, "set_noise_epoch"):
+            train_dataset.set_noise_epoch(epoch_idx)
         train_stats = train_one_epoch(model, train_loader, optimizer, device, args)
         val_stats = validate(model, val_loader, device, args)
+        current_val_score = float(val_stats["nmse"])
 
         epoch_record = {
             "epoch": epoch_idx,
@@ -387,7 +436,15 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             "train_steps": train_stats["num_steps"],
             "val_batches": val_stats["num_batches"],
             "observed_target_in_train": bool(train_stats["observed_target_in_train"]),
+            "best_val_metric": args.best_val_metric,
+            "best_val_score": current_val_score,
         }
+        for key, value in train_stats.items():
+            if key.startswith("train_input_noise_"):
+                epoch_record[key] = value
+        for key, value in val_stats.items():
+            if key.startswith("val_input_noise_"):
+                epoch_record[key] = value
         if "ssim" in val_stats:
             epoch_record["val_ssim"] = val_stats["ssim"]
         history.append(epoch_record)
@@ -398,10 +455,12 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             f"sup={epoch_record['train_supervised_loss']:.6f} "
             f"self={epoch_record['train_self_loss']:.6f} "
             f"val_nmse={epoch_record['val_nmse']:.6f} "
+            f"best_metric={args.best_val_metric}:{current_val_score:.6f} "
             f"val_psnr={epoch_record['val_psnr']:.3f}"
         )
 
-        if val_stats["nmse"] < best_val_nmse:
+        if current_val_score < best_val_score:
+            best_val_score = current_val_score
             best_val_nmse = val_stats["nmse"]
             save_checkpoint(
                 output_dir / "best.pt",
@@ -410,7 +469,11 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
                 epoch=epoch_idx,
                 history=history,
                 config=config,
-                extra={"best_val_nmse": best_val_nmse},
+                extra={
+                    "best_val_nmse": best_val_nmse,
+                    "best_val_score": best_val_score,
+                    "best_val_metric": args.best_val_metric,
+                },
             )
 
         if (epoch_idx + 1) % args.save_every == 0:
@@ -421,13 +484,27 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
                 epoch=epoch_idx,
                 history=history,
                 config=config,
-                extra={"best_val_nmse": best_val_nmse},
+                extra={
+                    "best_val_nmse": best_val_nmse,
+                    "best_val_score": best_val_score,
+                    "best_val_metric": args.best_val_metric,
+                },
             )
 
-        save_json(output_dir / "history.json", {"history": history, "best_val_nmse": best_val_nmse})
+        save_json(
+            output_dir / "history.json",
+            {
+                "history": history,
+                "best_val_nmse": best_val_nmse,
+                "best_val_score": best_val_score,
+                "best_val_metric": args.best_val_metric,
+            },
+        )
 
     summary = {
         "best_val_nmse": best_val_nmse,
+        "best_val_score": best_val_score,
+        "best_val_metric": args.best_val_metric,
         "history": history,
         "output_dir": str(output_dir),
         "training_objective": config["training_objective"],

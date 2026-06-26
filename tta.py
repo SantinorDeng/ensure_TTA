@@ -10,8 +10,8 @@ from typing import Any, Dict, Mapping
 import numpy as np
 import torch
 
-from cardiac_ensure.losses import compute_true_ensure_loss
-from cardiac_ensure.ops import dynamic_a_adjoint, dynamic_a_forward
+from cardiac_ensure.losses import compute_true_ensure_loss, ensure_data_term
+from cardiac_ensure.ops import dynamic_a_adjoint, dynamic_a_forward, solve_rho_ls
 from cardiac_ensure.scripts.eval_metrics import summarize_reconstruction_metrics, to_magnitude
 
 
@@ -234,6 +234,56 @@ def _true_ensure_loss_on_mask(
     )
 
 
+def _true_ensure_data_loss_on_mask(
+    model: torch.nn.Module,
+    *,
+    zf_input: torch.Tensor,
+    kspace: torch.Tensor,
+    maps: torch.Tensor,
+    mask: torch.Tensor,
+    density_weight: torch.Tensor | None,
+    cg_l2lam: float,
+    cg_max_iter: int,
+    cg_tol: float,
+) -> dict[str, torch.Tensor]:
+    prediction = model(zf_input, maps=maps, mask=mask)
+    rho_ls, rho_info = solve_rho_ls(
+        kspace=kspace,
+        maps=maps,
+        mask=mask,
+        l2lam=cg_l2lam,
+        max_iter=cg_max_iter,
+        tol=cg_tol,
+    )
+    data_out = ensure_data_term(
+        prediction=prediction,
+        rho_ls=rho_ls,
+        maps=maps,
+        mask=mask,
+        density_weight=density_weight,
+        l2lam=cg_l2lam,
+        max_iter=cg_max_iter,
+        tol=cg_tol,
+    )
+    zero = torch.zeros((), device=prediction.device, dtype=prediction.real.dtype)
+    data_term = data_out["data_term"]
+    return {
+        "loss": data_term,
+        "data_term": data_term,
+        "div_term": zero,
+        "div_scale": zero,
+        "div_contribution": zero,
+        "risk_proxy": data_term,
+        "prediction": prediction,
+        "rho_ls": rho_ls,
+        "projected_error": data_out["projected_error"],
+        "rho_info": rho_info,
+        "projection_info": data_out["projection_info"],
+        "frame_energy": data_out["frame_energy"],
+        "divergence_eps": zero,
+    }
+
+
 def run_true_ensure_tta(
     *,
     model: torch.nn.Module,
@@ -261,8 +311,8 @@ def run_true_ensure_tta(
     tic = time.time()
     if update_mode != "all_params":
         raise NotImplementedError("v1 cardiac ENSURE TTA only supports update_mode='all_params'")
-    if tta_loss not in ("ensure", "self_supervised"):
-        raise ValueError(f"Unsupported tta_loss={tta_loss!r}; choose 'ensure' or 'self_supervised'")
+    if tta_loss not in ("ensure", "ensure_data", "self_supervised"):
+        raise ValueError(f"Unsupported tta_loss={tta_loss!r}; choose 'ensure', 'ensure_data', or 'self_supervised'")
 
     kspace = batch["kspace_us"]
     zf = batch["zf"]
@@ -377,6 +427,19 @@ def run_true_ensure_tta(
                 divergence_mc_samples=divergence_mc_samples,
                 divergence_mode=divergence_mode,
                 project_divergence=project_divergence,
+            )
+            loss = loss_dict["loss"]
+        elif tta_loss == "ensure_data":
+            loss_dict = _true_ensure_data_loss_on_mask(
+                model_tta,
+                zf_input=train_zf,
+                kspace=train_kspace,
+                maps=maps,
+                mask=train_mask,
+                density_weight=density_weight,
+                cg_l2lam=cg_l2lam,
+                cg_max_iter=cg_max_iter,
+                cg_tol=cg_tol,
             )
             loss = loss_dict["loss"]
         else:
