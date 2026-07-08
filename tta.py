@@ -388,6 +388,7 @@ def run_true_ensure_tta(
     dc_min, dc_max = _dc_weight_stats(model_tta)
     initial_log: dict[str, float | int | None] = {
         "step": 0,
+        "cumulative_adapt_runtime_sec": adapt_runtime_sec,
         "train_loss": None,
         "self_val_loss": initial_val_loss_value,
         "data_term": None,
@@ -498,6 +499,7 @@ def run_true_ensure_tta(
         dc_min, dc_max = _dc_weight_stats(model_tta)
         log_row: dict[str, float | int | None] = {
             "step": step_idx + 1,
+            "cumulative_adapt_runtime_sec": adapt_runtime_sec,
             "train_loss": train_loss_value,
             "self_val_loss": val_loss_value,
             "data_term": _as_float(loss_dict["data_term"]),

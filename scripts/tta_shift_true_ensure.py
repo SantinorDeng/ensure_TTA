@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 from pathlib import Path
 import statistics
@@ -63,8 +64,12 @@ METRIC_NAMES = ("nmse", "nrmse", "psnr", "frame_diff_nmse", "ssim")
 METRICS_FIELDS = [
     "status",
     "method",
+    "training_objective",
     "checkpoint",
+    "checkpoint_sha256",
+    "manifest_sha256",
     "shift_name",
+    "experiment_family",
     "experiment_tier",
     "split_role",
     "rank_in_split",
@@ -74,7 +79,15 @@ METRICS_FIELDS = [
     "dataset",
     "split",
     "acquisition",
+    "source_acquisition",
+    "target_acquisition",
+    "patient_id",
+    "split_group_id",
+    "is_in_domain_control",
     "target_key",
+    "test_noise_snr_db",
+    "test_noise_seed",
+    "mask_seed",
     "run_tta",
     "update_mode",
     "num_trainable_params",
@@ -109,7 +122,12 @@ METRICS_FIELDS = [
 ]
 SUMMARY_FIELDS = [
     "method",
+    "training_objective",
     "shift_name",
+    "experiment_family",
+    "source_acquisition",
+    "target_acquisition",
+    "is_in_domain_control",
     "num_samples",
     "before_tta_nmse_mean",
     "before_tta_nmse_std",
@@ -145,6 +163,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--test-noise-snr-db", type=float, default=None)
     parser.add_argument("--test-noise-seed", type=int, default=9007)
+    parser.add_argument(
+        "--target-shift-name",
+        dest="target_shift_names",
+        action="append",
+        default=[],
+        help="Only evaluate matching target shift_name rows; repeat to select multiple cells.",
+    )
+    parser.add_argument(
+        "--training-objective",
+        default="auto",
+        help="Result label; 'auto' reads checkpoint config.",
+    )
     parser.add_argument("--tta-steps", type=int, default=250)
     parser.add_argument("--tta-lr", type=float, default=1.0e-5)
     parser.add_argument("--tta-weight-decay", type=float, default=0.0)
@@ -154,9 +184,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--update-mode", default="all_params", choices=("all_params", "adapter"))
     parser.add_argument(
         "--tta-loss",
-        default="ensure",
-        choices=("ensure", "ensure_data", "self_supervised"),
-        help="Loss used for TTA updates: full TRUE-ENSURE, TRUE-ENSURE data term only, or measured-kspace normalized L1.",
+        default="l1",
+        choices=("ensure", "ensure_data", "self_supervised", "l1"),
+        help="Loss used for TTA updates; l1 is an alias for measured-kspace normalized complex L1.",
     )
     parser.add_argument("--run-tta", dest="run_tta", action="store_true", default=True)
     parser.add_argument("--no-run-tta", dest="run_tta", action="store_false")
@@ -201,6 +231,7 @@ def load_model_from_checkpoint(path: Path, device: torch.device) -> tuple[Tempor
         residual=not bool(_config_value(config, "no_residual", False)),
         output_mode="all_frames",
         num_unrolls=int(_config_value(config, "num_unrolls", 12)),
+        denoiser_sharing=str(_config_value(config, "denoiser_sharing", "shared")),
     ).to(device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state_dict, strict=True)
@@ -226,10 +257,32 @@ def make_dataset(args: argparse.Namespace, config: Mapping[str, Any]) -> StaticS
         deterministic_masks=True,
         mask_seed=int(args.seed),
         return_target=True,
-        require_preproc=bool(_config_value(config, "require_preproc", False)),
+        # Training may require source-only sidecars. Target TTA must still support
+        # unseen acquisitions by estimating maps/noise from their measured volume.
+        require_preproc=False,
         test_noise_snr_db=args.test_noise_snr_db,
         test_noise_seed=int(args.test_noise_seed),
+        shift_names=args.target_shift_names,
     )
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_training_objective(requested: str, config: Mapping[str, Any]) -> str:
+    if requested != "auto":
+        return str(requested)
+    configured = str(config.get("training_objective", "")).strip()
+    if configured:
+        return configured
+    if "cg_l2lam" in config or "divergence_mode" in config:
+        return "true_ensure"
+    return "unknown_training_objective"
 
 
 def write_csv(path: Path, rows: list[dict[str, object]], fields: list[str]) -> None:
@@ -266,17 +319,27 @@ def metric_row_base(
     *,
     status: str,
     method: str,
+    training_objective: str,
     checkpoint: Path,
+    checkpoint_sha256: str,
+    manifest_sha256: str,
     manifest_row: Mapping[str, str],
     run_tta: bool,
     update_mode: str,
+    test_noise_snr_db: float | None,
+    test_noise_seed: int,
+    mask_seed: int,
     error: str = "",
 ) -> dict[str, object]:
     return {
         "status": status,
         "method": method,
+        "training_objective": training_objective,
         "checkpoint": str(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
+        "manifest_sha256": manifest_sha256,
         "shift_name": manifest_row.get("shift_name", ""),
+        "experiment_family": manifest_row.get("experiment_family", ""),
         "experiment_tier": manifest_row.get("experiment_tier", ""),
         "split_role": manifest_row.get("split_role", ""),
         "rank_in_split": manifest_row.get("rank_in_split", ""),
@@ -286,7 +349,15 @@ def metric_row_base(
         "dataset": manifest_row.get("dataset", ""),
         "split": manifest_row.get("split", ""),
         "acquisition": manifest_row.get("acquisition", ""),
+        "source_acquisition": manifest_row.get("source_acquisition", ""),
+        "target_acquisition": manifest_row.get("target_acquisition", ""),
+        "patient_id": manifest_row.get("patient_id", ""),
+        "split_group_id": manifest_row.get("split_group_id", ""),
+        "is_in_domain_control": manifest_row.get("is_in_domain_control", ""),
         "target_key": manifest_row.get("target_key", ""),
+        "test_noise_snr_db": "clean" if test_noise_snr_db is None else test_noise_snr_db,
+        "test_noise_seed": int(test_noise_seed),
+        "mask_seed": int(mask_seed),
         "run_tta": bool(run_tta),
         "update_mode": update_mode if run_tta else "",
         "num_trainable_params": 0,
@@ -432,12 +503,19 @@ def aggregate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     ok_rows = [row for row in rows if row.get("status") == "ok"]
     if not ok_rows:
         return []
-    grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+    grouped: dict[tuple[str, str, str], list[dict[str, object]]] = {}
     for row in ok_rows:
-        grouped.setdefault((str(row.get("method", "")), str(row.get("shift_name", ""))), []).append(row)
+        grouped.setdefault(
+            (
+                str(row.get("method", "")),
+                str(row.get("training_objective", "")),
+                str(row.get("shift_name", "")),
+            ),
+            [],
+        ).append(row)
 
     summaries: list[dict[str, object]] = []
-    for (method, shift_name), group in sorted(grouped.items()):
+    for (method, training_objective, shift_name), group in sorted(grouped.items()):
         before_nmse = [value for value in (finite(row, "before_tta_nmse") for row in group) if value is not None]
         after_nmse = [value for value in (finite(row, "after_tta_nmse") for row in group) if value is not None]
         delta_nmse = [value for value in (finite(row, "delta_nmse") for row in group) if value is not None]
@@ -472,7 +550,12 @@ def aggregate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         summaries.append(
             {
                 "method": method,
+                "training_objective": training_objective,
                 "shift_name": shift_name,
+                "experiment_family": group[0].get("experiment_family", ""),
+                "source_acquisition": group[0].get("source_acquisition", ""),
+                "target_acquisition": group[0].get("target_acquisition", ""),
+                "is_in_domain_control": group[0].get("is_in_domain_control", ""),
                 "num_samples": len(group),
                 "before_tta_nmse_mean": before_nmse_mean,
                 "before_tta_nmse_std": before_nmse_std,
@@ -508,6 +591,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     payload_path = output_dir / "summary.json"
 
     model, checkpoint_config = load_model_from_checkpoint(args.checkpoint, device)
+    training_objective = resolve_training_objective(args.training_objective, checkpoint_config)
+    checkpoint_hash = file_sha256(args.checkpoint)
+    manifest_hash = file_sha256(args.manifest_csv)
     dataset = make_dataset(args, checkpoint_config)
     loader = DataLoader(
         dataset,
@@ -518,15 +604,16 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         drop_last=False,
     )
     max_samples = len(dataset) if args.max_samples is None else min(int(args.max_samples), len(dataset))
+    effective_tta_loss = "self_supervised" if args.tta_loss == "l1" else args.tta_loss
     if args.run_tta:
         method_by_loss = {
             "ensure": "true_ensure_tta",
             "ensure_data": "true_ensure_data_tta",
-            "self_supervised": "true_ensure_self_supervised_tta",
+            "self_supervised": "measured_kspace_l1_tta",
         }
-        method = method_by_loss[args.tta_loss]
+        method = method_by_loss[effective_tta_loss]
     else:
-        method = "true_ensure_frozen"
+        method = "frozen"
 
     crop_height = args.crop_height if args.crop_height is not None else checkpoint_config.get("crop_height")
     crop_width = args.crop_width if args.crop_width is not None else checkpoint_config.get("crop_width")
@@ -535,8 +622,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     print(f"Output: {output_dir}", flush=True)
     print(f"Device: {device}", flush=True)
     print(f"Checkpoint: {args.checkpoint}", flush=True)
+    print(f"Training objective: {training_objective}", flush=True)
     print(f"Manifest: {args.manifest_csv} split_role={args.split_role} rows={max_samples}", flush=True)
-    print(f"TTA loss: {args.tta_loss}", flush=True)
+    print(f"TTA loss: {args.tta_loss} (effective={effective_tta_loss})", flush=True)
     print(f"Test noise SNR dB: {args.test_noise_snr_db}", flush=True)
 
     progress = tqdm(enumerate(loader), total=max_samples, desc=method)
@@ -547,10 +635,16 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         row = metric_row_base(
             status="ok",
             method=method,
+            training_objective=training_objective,
             checkpoint=args.checkpoint,
+            checkpoint_sha256=checkpoint_hash,
+            manifest_sha256=manifest_hash,
             manifest_row=manifest_row,
             run_tta=args.run_tta,
             update_mode=args.update_mode,
+            test_noise_snr_db=args.test_noise_snr_db,
+            test_noise_seed=args.test_noise_seed,
+            mask_seed=args.seed,
         )
         try:
             batch = move_to_device(batch, device)
@@ -577,7 +671,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 divergence_mc_samples=int(_config_value(checkpoint_config, "divergence_mc_samples", 1)),
                 divergence_mode=str(_config_value(checkpoint_config, "divergence_mode", "measurement")),
                 project_divergence=not bool(_config_value(checkpoint_config, "no_divergence_projection", False)),
-                tta_loss=args.tta_loss,
+                tta_loss=effective_tta_loss,
             )
             populate_result_fields(row, result, meta)
             if args.save_curves and args.run_tta:
@@ -600,10 +694,16 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             row = metric_row_base(
                 status="failed",
                 method=method,
+                training_objective=training_objective,
                 checkpoint=args.checkpoint,
+                checkpoint_sha256=checkpoint_hash,
+                manifest_sha256=manifest_hash,
                 manifest_row=manifest_row,
                 run_tta=args.run_tta,
                 update_mode=args.update_mode,
+                test_noise_snr_db=args.test_noise_snr_db,
+                test_noise_seed=args.test_noise_seed,
+                mask_seed=args.seed,
                 error=error,
             )
             rows.append(row)
@@ -623,9 +723,14 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "device": str(device),
         "split_role": args.split_role,
         "method": method,
+        "training_objective": training_objective,
         "tta_loss": args.tta_loss,
-        "uses_ensure_loss": args.tta_loss in ("ensure", "ensure_data"),
-        "uses_ensure_divergence": args.tta_loss == "ensure",
+        "effective_tta_loss": effective_tta_loss,
+        "uses_ensure_loss": effective_tta_loss in ("ensure", "ensure_data"),
+        "uses_ensure_divergence": effective_tta_loss == "ensure",
+        "checkpoint_sha256": checkpoint_hash,
+        "manifest_sha256": manifest_hash,
+        "target_shift_names": list(args.target_shift_names),
         "num_dataset_rows": len(dataset),
         "num_requested_rows": max_samples,
         "num_metric_rows": len(rows),

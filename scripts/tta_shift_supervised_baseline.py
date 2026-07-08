@@ -219,6 +219,7 @@ def load_model_from_checkpoint(path: Path, device: torch.device) -> tuple[Tempor
         residual=not bool(_config_value(config, "no_residual", False)),
         output_mode="all_frames",
         num_unrolls=int(_config_value(config, "num_unrolls", 12)),
+        denoiser_sharing=str(_config_value(config, "denoiser_sharing", "shared")),
     ).to(device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state_dict, strict=True)

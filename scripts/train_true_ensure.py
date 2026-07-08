@@ -122,6 +122,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--chans", type=int, default=64)
     parser.add_argument("--num-pools", type=int, default=4)
     parser.add_argument("--num-unrolls", type=int, default=3)
+    parser.add_argument(
+        "--denoiser-sharing",
+        choices=("shared", "independent"),
+        default="shared",
+        help="Reuse one denoiser across unrolls or train one denoiser per unroll.",
+    )
     parser.add_argument("--drop-prob", type=float, default=0.0)
     parser.add_argument("--no-residual", action="store_true")
     parser.add_argument("--device", type=str, default=None)
@@ -425,6 +431,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         residual=not args.no_residual,
         output_mode="all_frames",
         num_unrolls=args.num_unrolls,
+        denoiser_sharing=args.denoiser_sharing,
     ).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 

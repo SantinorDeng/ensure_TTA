@@ -61,6 +61,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--chans", type=int, default=64)
     parser.add_argument("--num-pools", type=int, default=4)
     parser.add_argument("--num-unrolls", type=int, default=12)
+    parser.add_argument(
+        "--denoiser-sharing",
+        choices=("shared", "independent"),
+        default="shared",
+        help="Reuse one denoiser across unrolls or train one denoiser per unroll.",
+    )
     parser.add_argument("--drop-prob", type=float, default=0.0)
     parser.add_argument("--no-residual", action="store_true")
     parser.add_argument("--device", type=str, default=None)
@@ -164,6 +170,7 @@ def _make_model(args: argparse.Namespace, device: torch.device) -> TemporalNormU
         residual=not args.no_residual,
         output_mode="all_frames",
         num_unrolls=args.num_unrolls,
+        denoiser_sharing=args.denoiser_sharing,
     ).to(device)
 
 
@@ -576,6 +583,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
 
     config = vars(args).copy()
     config["device"] = str(device)
+    config["training_objective"] = "true_ensure"
     config["train_dataset_len"] = len(train_dataset)
     config["val_dataset_len"] = len(val_dataset)
     config["num_parameters"] = count_trainable_parameters(model)

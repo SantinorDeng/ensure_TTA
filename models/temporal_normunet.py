@@ -198,6 +198,7 @@ class TemporalNormUnet(nn.Module):
         output_mode: str = "all_frames",
         num_unrolls: int = 3,
         use_data_consistency: bool = True,
+        denoiser_sharing: str = "shared",
     ) -> None:
         super().__init__()
         if num_frames <= 0:
@@ -208,6 +209,10 @@ class TemporalNormUnet(nn.Module):
             raise ValueError(f"num_unrolls must be positive, got {num_unrolls}")
         if output_mode not in {"all_frames", "center_frame"}:
             raise ValueError(f"Unsupported output_mode={output_mode}")
+        if denoiser_sharing not in {"shared", "independent"}:
+            raise ValueError(
+                f"Unsupported denoiser_sharing={denoiser_sharing!r}; choose 'shared' or 'independent'"
+            )
 
         self.num_frames = int(num_frames)
         self.center_frame = self.num_frames // 2
@@ -215,14 +220,21 @@ class TemporalNormUnet(nn.Module):
         self.output_mode = output_mode
         self.num_unrolls = int(num_unrolls)
         self.use_data_consistency = bool(use_data_consistency)
+        self.denoiser_sharing = str(denoiser_sharing)
 
-        self.norm_unet = NormUnet(
-            chans=chans,
-            num_pools=num_pools,
-            in_chans=2 * self.num_frames,
-            out_chans=2 * self.num_frames,
-            drop_prob=drop_prob,
-        )
+        denoiser_kwargs = {
+            "chans": chans,
+            "num_pools": num_pools,
+            "in_chans": 2 * self.num_frames,
+            "out_chans": 2 * self.num_frames,
+            "drop_prob": drop_prob,
+        }
+        if self.denoiser_sharing == "shared":
+            self.norm_unet = NormUnet(**denoiser_kwargs)
+        else:
+            self.norm_unets = nn.ModuleList(
+                [NormUnet(**denoiser_kwargs) for _ in range(self.num_unrolls)]
+            )
         self.dc_blocks = nn.ModuleList(
             [SoftDataConsistency(init_weight=0.99) for _ in range(self.num_unrolls)]
         )
@@ -271,9 +283,17 @@ class TemporalNormUnet(nn.Module):
 
         return x
 
-    def _run_denoiser(self, x_complex: torch.Tensor) -> torch.Tensor:
+    def _run_denoiser(self, x_complex: torch.Tensor, cascade_idx: int = 0) -> torch.Tensor:
         x_real = torch.view_as_real(x_complex.squeeze(2).contiguous())
-        y_real = self.norm_unet(x_real)
+        if self.denoiser_sharing == "shared":
+            denoiser = self.norm_unet
+        else:
+            if cascade_idx < 0 or cascade_idx >= self.num_unrolls:
+                raise IndexError(
+                    f"cascade_idx={cascade_idx} is outside [0, {self.num_unrolls})"
+                )
+            denoiser = self.norm_unets[cascade_idx]
+        y_real = denoiser(x_real)
         y_complex = torch.view_as_complex(y_real.contiguous())[:, :, None, ...]
         if self.residual:
             y_complex = y_complex + x_complex
@@ -295,7 +315,7 @@ class TemporalNormUnet(nn.Module):
         current = x_complex
         reference = x_complex
         for cascade_idx in range(self.num_unrolls):
-            current = self._run_denoiser(current)
+            current = self._run_denoiser(current, cascade_idx=cascade_idx)
             if self.use_data_consistency:
                 current = self.dc_blocks[cascade_idx](current, reference_image=reference, maps=maps, mask=mask)
 

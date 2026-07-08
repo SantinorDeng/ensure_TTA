@@ -80,9 +80,16 @@ def read_manifest_rows(manifest_csv: str | Path) -> List[Dict[str, str]]:
 def source_manifest_rows(
     manifest_csv: str | Path,
     source_role: str = DEFAULT_SOURCE_ROLE,
+    shift_names: Sequence[str] | None = None,
 ) -> List[Dict[str, str]]:
     rows = read_manifest_rows(manifest_csv)
-    return [row for row in rows if row.get("split_role", "") == source_role]
+    allowed = set(shift_names or [])
+    return [
+        row
+        for row in rows
+        if row.get("split_role", "") == source_role
+        and (not allowed or row.get("shift_name", "") in allowed)
+    ]
 
 
 def parse_json_tuple(value: object) -> Tuple[int, ...]:
@@ -119,6 +126,11 @@ def coil_count_from_row(row: Mapping[str, str]) -> int:
 
 def volume_key_for_row(row: Mapping[str, str]) -> str:
     return f"{Path(row['path']).resolve()}::{row.get('volume_id') or Path(row['path']).stem}"
+
+
+def split_group_key_for_row(row: Mapping[str, str]) -> str:
+    value = str(row.get("split_group_id", "")).strip()
+    return value or volume_key_for_row(row)
 
 
 def sample_id_for_row(row: Mapping[str, str]) -> str:
@@ -164,7 +176,7 @@ def split_source_rows(
     if not (0.0 <= float(val_fraction) < 1.0):
         raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
 
-    volume_keys = sorted({volume_key_for_row(row) for row in rows})
+    volume_keys = sorted({split_group_key_for_row(row) for row in rows})
     shuffled = list(volume_keys)
     rng = np.random.default_rng(int(seed))
     rng.shuffle(shuffled)
@@ -207,7 +219,7 @@ def split_source_rows(
             selected_keys = val_keys
         else:
             selected_keys = set(volume_keys)
-        selected = [row for row in rows if volume_key_for_row(row) in selected_keys]
+        selected = [row for row in rows if split_group_key_for_row(row) in selected_keys]
 
     summary = {
         "subset": subset,
@@ -225,6 +237,7 @@ def split_source_rows(
         "train_volume_keys": sorted(train_keys),
         "val_volume_keys": sorted(val_keys),
         "selected_sample_ids": [sample_id_for_row(row) for row in selected],
+        "split_group_key": "split_group_id_or_volume_key",
     }
     return selected, summary
 
@@ -348,6 +361,7 @@ class StaticShiftSourceENSUREDataset(Dataset):
         input_noise_seed: int = 0,
         test_noise_snr_db: float | None = None,
         test_noise_seed: int = 0,
+        shift_names: Sequence[str] | None = None,
     ) -> None:
         if int(window_size) != 1:
             raise ValueError("StaticShiftSourceENSUREDataset is source-static and currently requires window_size=1")
@@ -396,12 +410,17 @@ class StaticShiftSourceENSUREDataset(Dataset):
         self.input_noise_snr_db_max = max_snr
         self.input_noise_seed = int(input_noise_seed)
         self.input_noise_epoch = 0
+        self.shift_names = tuple(str(name) for name in (shift_names or ()))
         self._input_noise_seed_token = "test_noise" if test_snr is not None else "input_noise"
         self._input_noise_include_epoch = test_snr is None
         self._map_cache: Dict[Tuple[Path, int], np.ndarray] = {}
         self._density_cache: Dict[Tuple[int, int, float, float], Dict[str, np.ndarray]] = {}
 
-        source_rows = source_manifest_rows(self.manifest_csv, source_role=self.source_role)
+        source_rows = source_manifest_rows(
+            self.manifest_csv,
+            source_role=self.source_role,
+            shift_names=self.shift_names,
+        )
         if not source_rows:
             raise ValueError(f"No rows with split_role={self.source_role!r} in {self.manifest_csv}")
         selected_rows, split_summary = split_source_rows(
@@ -463,6 +482,7 @@ class StaticShiftSourceENSUREDataset(Dataset):
                 "input_noise_snr_db_max": self.input_noise_snr_db_max,
                 "input_noise_seed": int(self.input_noise_seed),
                 "input_noise_epoch": int(self.input_noise_epoch),
+                "shift_names": list(self.shift_names),
             }
         )
         return out
