@@ -6,6 +6,7 @@ from cardiac_ensure.scripts.build_shift_source_manifests import (
     select_paired_patient_rows,
 )
 from cardiac_ensure.scripts.run_modality_matrix_job import (
+    TRAINING_OBJECTIVES,
     build_argparser as build_job_argparser,
     manifest_path,
     parse_snr,
@@ -120,3 +121,19 @@ def test_single_job_cli_requires_explicit_device() -> None:
     assert manifest_path("knee", "pd").name == "pd.csv"
     assert parse_snr("clean") is None
     assert parse_snr("10") == 10.0
+
+
+def test_single_job_cli_accepts_ssdu_method() -> None:
+    parser = build_job_argparser()
+    args = parser.parse_args(
+        [
+            "train",
+            "--dataset", "brain",
+            "--source", "axflair",
+            "--method", "ssdu",
+            "--device", "cuda:6",
+            "--dry-run",
+        ]
+    )
+    assert args.method == "ssdu"
+    assert TRAINING_OBJECTIVES["ssdu"] == "ssdu"

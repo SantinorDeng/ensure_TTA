@@ -26,6 +26,7 @@ SOURCES = {
 }
 TRAINING_OBJECTIVES = {
     "ensure": "true_ensure",
+    "ssdu": "ssdu",
     "traditional": "normalized_l1_supervised_plus_measured_kspace_self_supervision",
 }
 TRAIN_TAG = "r4_w1_unroll12_seed7_train_noise_snr15_25_val20_seed7007"
@@ -185,7 +186,12 @@ def train(args: argparse.Namespace) -> int:
         if not manifest_path(args.dataset, args.source, args.tier).is_file():
             raise FileNotFoundError("Missing modality manifest; run the prepare subcommand first")
 
-    script = "train_shift_true_ensure.py" if args.method == "ensure" else "train_supervised_baseline.py"
+    if args.method == "ensure":
+        script = "train_shift_true_ensure.py"
+    elif args.method == "ssdu":
+        script = "train_shift_ssdu.py"
+    else:
+        script = "train_supervised_baseline.py"
     command: list[object] = [
         sys.executable,
         ROOT / "scripts" / script,
@@ -218,6 +224,13 @@ def train(args: argparse.Namespace) -> int:
         "--num-workers", args.num_workers,
         "--require-preproc",
     ]
+    if args.method == "ssdu":
+        command.extend(
+            [
+                "--ssdu-rho", "0.4",
+                "--ssdu-mask-type", "gaussian",
+            ]
+        )
     return run_command(command, log_path=output_dir / "run.log", dry_run=args.dry_run)
 
 
