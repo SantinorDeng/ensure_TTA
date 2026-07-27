@@ -196,6 +196,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--no-save-curves", dest="save_curves", action="store_false")
     parser.add_argument("--preproc-root", type=Path, default=None)
     parser.add_argument("--density-root", type=Path, default=None)
+    parser.add_argument(
+        "--acceleration",
+        type=float,
+        default=None,
+        help="Override the checkpoint acceleration for target-test mask generation.",
+    )
+    parser.add_argument(
+        "--sigma-mask",
+        type=float,
+        default=None,
+        help="Override the checkpoint sigma_mask for target-test mask generation.",
+    )
     parser.add_argument("--crop-height", type=int, default=None)
     parser.add_argument("--crop-width", type=int, default=None)
     parser.add_argument("--fail-fast", action="store_true")
@@ -251,8 +263,8 @@ def make_dataset(args: argparse.Namespace, config: Mapping[str, Any]) -> StaticS
         val_fraction=float(_config_value(config, "val_fraction", 0.2)),
         split_seed=int(_config_value(config, "split_seed", args.seed)),
         allow_slice_val_fallback=bool(_config_value(config, "allow_slice_val_fallback", True)),
-        acceleration=float(_config_value(config, "acceleration", 4.0)),
-        sigma_mask=float(_config_value(config, "sigma_mask", 0.18)),
+        acceleration=float(args.acceleration if args.acceleration is not None else _config_value(config, "acceleration", 4.0)),
+        sigma_mask=float(args.sigma_mask if args.sigma_mask is not None else _config_value(config, "sigma_mask", 0.18)),
         window_size=int(_config_value(config, "window_size", 1)),
         deterministic_masks=True,
         mask_seed=int(args.seed),

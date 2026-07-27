@@ -171,6 +171,123 @@ def make_shifts(result_noise_tag: str) -> tuple[ShiftSpec, ...]:
         ),
     )
 
+
+def make_other_modality_shifts(result_noise_tag: str) -> tuple[ShiftSpec, ...]:
+    if result_noise_tag != "clean":
+        raise ValueError(f"Other modality comparison currently supports only clean results, got {result_noise_tag!r}")
+    tag = "clean_r4"
+    return (
+        ShiftSpec(
+            key="t1_to_t2",
+            label="AXT1 -> AXT2",
+            methods=(
+                MethodSpec(
+                    "zero_filled",
+                    "Zero-filled",
+                    rel(f"outputs/baselines/other_modality/t1_to_t2/zero_filled_{tag}_maskseed7_noiseseed9007"),
+                    False,
+                ),
+                MethodSpec(
+                    "pics",
+                    "PICS",
+                    rel(f"outputs/baselines/other_modality/t1_to_t2/bart_pics_tvxy_lam0p05_{tag}_maskseed7_noiseseed9007"),
+                    False,
+                ),
+                MethodSpec(
+                    "ssdu",
+                    "SSDU + TTA",
+                    rel(f"outputs/tta/other_modality/t1_to_t2/ssdu_l1_{tag}_maskseed7_noiseseed9007"),
+                    True,
+                ),
+                MethodSpec(
+                    "traditional",
+                    "Traditional + TTA",
+                    rel(f"outputs/tta/other_modality/t1_to_t2/traditional_l1_{tag}_maskseed7_noiseseed9007"),
+                    True,
+                ),
+                MethodSpec(
+                    "ensure",
+                    "ENSURE + TTA",
+                    rel(f"outputs/tta/other_modality/t1_to_t2/ensure_l1_{tag}_maskseed7_noiseseed9007"),
+                    True,
+                ),
+            ),
+        ),
+        ShiftSpec(
+            key="t1_to_post",
+            label="AXT1 -> AXT1POST",
+            methods=(
+                MethodSpec(
+                    "zero_filled",
+                    "Zero-filled",
+                    rel(f"outputs/baselines/other_modality/t1_to_post/zero_filled_{tag}_maskseed7_noiseseed9007"),
+                    False,
+                ),
+                MethodSpec(
+                    "pics",
+                    "PICS",
+                    rel(f"outputs/baselines/other_modality/t1_to_post/bart_pics_tvxy_lam0p05_{tag}_maskseed7_noiseseed9007"),
+                    False,
+                ),
+                MethodSpec(
+                    "ssdu",
+                    "SSDU + TTA",
+                    rel(f"outputs/tta/other_modality/t1_to_post/ssdu_l1_{tag}_maskseed7_noiseseed9007"),
+                    True,
+                ),
+                MethodSpec(
+                    "traditional",
+                    "Traditional + TTA",
+                    rel(f"outputs/tta/other_modality/t1_to_post/traditional_l1_{tag}_maskseed7_noiseseed9007"),
+                    True,
+                ),
+                MethodSpec(
+                    "ensure",
+                    "ENSURE + TTA",
+                    rel(f"outputs/tta/other_modality/t1_to_post/ensure_l1_{tag}_maskseed7_noiseseed9007"),
+                    True,
+                ),
+            ),
+        ),
+        ShiftSpec(
+            key="t2_to_post",
+            label="AXT2 -> AXT1POST",
+            methods=(
+                MethodSpec(
+                    "zero_filled",
+                    "Zero-filled",
+                    rel(f"outputs/baselines/other_modality/t2_to_post/zero_filled_{tag}_maskseed7_noiseseed9007"),
+                    False,
+                ),
+                MethodSpec(
+                    "pics",
+                    "PICS",
+                    rel(f"outputs/baselines/other_modality/t2_to_post/bart_pics_tvxy_lam0p05_{tag}_maskseed7_noiseseed9007"),
+                    False,
+                ),
+                MethodSpec(
+                    "ssdu",
+                    "SSDU + TTA",
+                    rel(f"outputs/tta/other_modality/t2_to_post/ssdu_l1_{tag}_maskseed7_noiseseed9007"),
+                    True,
+                ),
+                MethodSpec(
+                    "traditional",
+                    "Traditional + TTA",
+                    rel(f"outputs/tta/other_modality/t2_to_post/traditional_l1_{tag}_maskseed7_noiseseed9007"),
+                    True,
+                ),
+                MethodSpec(
+                    "ensure",
+                    "ENSURE + TTA",
+                    rel(f"outputs/tta/other_modality/t2_to_post/ensure_l1_{tag}_maskseed7_noiseseed9007"),
+                    True,
+                ),
+            ),
+        ),
+    )
+
+
 SELECTED_SAMPLE_OVERRIDES: dict[str, str] = {
     "t1_to_flair": "fastmri_brain:file_brain_AXFLAIR_200_6002560:slice0006",
     "t2_to_flair": "fastmri_brain:file_brain_AXFLAIR_200_6002584:slice0010",
@@ -180,6 +297,8 @@ ZOOM_ROIS: dict[str, tuple[int, int, int, int]] = {
     "pre_to_post": (145, 55, 55, 40),
     "t1_to_flair": (182, 120, 62, 44),
     "t2_to_flair": (112, 92, 58, 42),
+    "t1_to_post": (145, 55, 55, 40),
+    "t2_to_post": (145, 55, 55, 40),
 }
 
 
@@ -277,7 +396,7 @@ def read_metrics(method: MethodSpec) -> pd.DataFrame:
     return df
 
 
-def choose_sample(shift: ShiftSpec) -> dict[str, object]:
+def choose_sample(shift: ShiftSpec, sample_overrides: dict[str, str] | None = None) -> dict[str, object]:
     metrics = {method.key: read_metrics(method) for method in shift.methods}
     ensure = metrics["ensure"][["sample_id", "metric_nmse", "metric_ssim"]].rename(
         columns={"metric_nmse": "ensure_nmse", "metric_ssim": "ensure_ssim"}
@@ -302,7 +421,7 @@ def choose_sample(shift: ShiftSpec) -> dict[str, object]:
         + 0.35 * (merged["ensure_ssim"] - merged["best_other_ssim"])
         + 0.15 * (merged["worst_other_nmse"] - merged["ensure_nmse"]) / merged["worst_other_nmse"].clip(lower=1.0e-8)
     )
-    sample_override = SELECTED_SAMPLE_OVERRIDES.get(shift.key)
+    sample_override = (sample_overrides or {}).get(shift.key, SELECTED_SAMPLE_OVERRIDES.get(shift.key))
     if sample_override is not None:
         matches = merged[merged["sample_id"].astype(str) == sample_override]
         if matches.empty:
@@ -520,18 +639,54 @@ def plot_shift(shift: ShiftSpec, selection: dict[str, object], output_dir: Path,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--result-noise-tag", choices=("clean", "snr15"), default="clean")
+    parser.add_argument(
+        "--result-noise-tag",
+        choices=("clean", "snr15", "clean_r8", "clean_r6", "clean_r12", "snr15_r8"),
+        default="clean",
+    )
+    parser.add_argument(
+        "--shift-key",
+        action="append",
+        choices=("t1_to_flair", "t2_to_flair", "pre_to_post", "t1_to_t2", "t1_to_post", "t2_to_post"),
+        default=[],
+        help="Only render selected shift key(s). Repeat to render more than one. Defaults to all shifts.",
+    )
+    parser.add_argument(
+        "--comparison-set",
+        choices=("modality_matrix", "other_modality"),
+        default="modality_matrix",
+        help="Which predefined comparison group to render.",
+    )
+    parser.add_argument(
+        "--sample-override",
+        action="append",
+        default=[],
+        metavar="SHIFT_KEY=SAMPLE_ID",
+        help="Use a specific sample_id for one shift. Repeat for multiple shifts.",
+    )
     parser.add_argument("--dpi", type=int, default=300)
     args = parser.parse_args()
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    shifts = make_shifts(args.result_noise_tag)
+    if args.comparison_set == "other_modality":
+        shifts = make_other_modality_shifts(args.result_noise_tag)
+    else:
+        shifts = make_shifts(args.result_noise_tag)
+    if args.shift_key:
+        selected = set(args.shift_key)
+        shifts = tuple(shift for shift in shifts if shift.key in selected)
+    sample_overrides: dict[str, str] = {}
+    for item in args.sample_override:
+        if "=" not in item:
+            raise ValueError(f"--sample-override must be SHIFT_KEY=SAMPLE_ID, got {item!r}")
+        key, sample_id = item.split("=", 1)
+        sample_overrides[key] = sample_id
 
     table = build_tables(shifts, output_dir)
     figure_paths = []
     for shift in shifts:
-        selection = choose_sample(shift)
+        selection = choose_sample(shift, sample_overrides)
         figure_paths.append(plot_shift(shift, selection, output_dir, dpi=args.dpi))
 
     print(f"Wrote table rows: {len(table)}")
