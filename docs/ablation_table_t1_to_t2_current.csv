@@ -1,0 +1,6 @@
+source_training,target_time_method,adapted_parameters,trainable_parameters,full_ensure_fraction,psnr_db,ssim,nmse,delta_psnr_db,adapt_sec_per_slice,total_sec_per_slice,negative_adaptation_rate,num_samples,status
+TRUE-ENSURE,Frozen / no TTA,None,0,0.000000,33.548242,0.874148,0.217368,0.000000,0.000000,,0.000000,100,complete metrics recovered from step-0 outputs
+TRUE-ENSURE,Full-parameter TTA,Full network,1354764,1.000000,37.091642,0.959199,0.004667,3.543400,171.771538,180.286887,0.010000,100,complete
+TRUE-ENSURE,Conv-LoRA r=2 + 12 DC scalars,LoRA + DC,46092,0.034022,36.668137,0.954742,0.005457,3.119895,45.839765,48.222946,0.040000,100,complete
+SSDU,Full-parameter TTA,Full network,112908,,34.435321,0.915319,0.144093,4.114324,87.590848,101.401135,0.070000,100,complete
+Supervised + self-supervised source training,Full-parameter TTA,Full network,1354764,1.000000,35.878262,0.939944,0.006135,8.208188,102.528024,115.353778,0.010000,100,complete

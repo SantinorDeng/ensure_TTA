@@ -173,9 +173,12 @@ def make_shifts(result_noise_tag: str) -> tuple[ShiftSpec, ...]:
 
 
 def make_other_modality_shifts(result_noise_tag: str) -> tuple[ShiftSpec, ...]:
-    if result_noise_tag != "clean":
+    if result_noise_tag == "clean":
+        tag = "clean_r4"
+    elif result_noise_tag in ("clean_r6", "clean_r8"):
+        tag = result_noise_tag
+    else:
         raise ValueError(f"Other modality comparison currently supports only clean results, got {result_noise_tag!r}")
-    tag = "clean_r4"
     return (
         ShiftSpec(
             key="t1_to_t2",
@@ -288,6 +291,99 @@ def make_other_modality_shifts(result_noise_tag: str) -> tuple[ShiftSpec, ...]:
     )
 
 
+def make_table1_shifts(result_noise_tag: str) -> tuple[ShiftSpec, ...]:
+    """Build the exact clean R=4 method/shift set reported in Table 1."""
+    if result_noise_tag != "clean":
+        raise ValueError(f"Table 1 comparison supports only clean results, got {result_noise_tag!r}")
+
+    method_labels = {
+        "zero_filled": "Zero-filled",
+        "pics": "PICS",
+        "ssdu": "SSDU+TTA",
+        "traditional": "Supervised+TTA",
+        "ensure": "Ours",
+    }
+
+    def method(key: str, path: str, is_tta: bool) -> MethodSpec:
+        return MethodSpec(key, method_labels[key], rel(path), is_tta)
+
+    return (
+        ShiftSpec(
+            key="t1_to_flair",
+            label="T1→FLAIR",
+            methods=(
+                method(
+                    "zero_filled",
+                    "outputs/baselines/shifts/modality_matrix/main/brain/axflair/"
+                    "zero_filled_clean_maskseed7_noiseseed9007",
+                    False,
+                ),
+                method(
+                    "pics",
+                    "outputs/baselines/shifts/modality_matrix/main/brain/axflair/"
+                    "bart_pics_tvxy_lam0p05_clean_maskseed7_noiseseed9007",
+                    False,
+                ),
+                method(
+                    "ssdu",
+                    "outputs/tta/_runtime_recheck_t1_to_flair_20260813_Ef0umh/ssdu_full_tta",
+                    True,
+                ),
+                method(
+                    "traditional",
+                    "outputs/tta/_runtime_recheck_t1_to_flair_20260813_Ef0umh/traditional_full_tta",
+                    True,
+                ),
+                method(
+                    "ensure",
+                    "outputs/tta/other_modality/t1_to_flair/"
+                    "ensure_convlora_r2_dc_l1_clean_r4_lr1e-3_maskseed7_noiseseed9007",
+                    True,
+                ),
+            ),
+        ),
+        *tuple(
+            ShiftSpec(
+                key=shift_key,
+                label=shift_label,
+                methods=(
+                    method(
+                        "zero_filled",
+                        f"outputs/baselines/other_modality/{shift_key}/"
+                        "zero_filled_clean_r4_maskseed7_noiseseed9007",
+                        False,
+                    ),
+                    method(
+                        "pics",
+                        f"outputs/baselines/other_modality/{shift_key}/"
+                        "bart_pics_tvxy_lam0p05_clean_r4_maskseed7_noiseseed9007",
+                        False,
+                    ),
+                    method(
+                        "ssdu",
+                        f"outputs/tta/other_modality/{shift_key}/"
+                        "ssdu_l1_clean_r4_maskseed7_noiseseed9007",
+                        True,
+                    ),
+                    method(
+                        "traditional",
+                        f"outputs/tta/other_modality/{shift_key}/"
+                        "traditional_l1_clean_r4_maskseed7_noiseseed9007",
+                        True,
+                    ),
+                    method(
+                        "ensure",
+                        f"outputs/tta/other_modality/{shift_key}/"
+                        "ensure_convlora_r2_dc_l1_clean_r4_lr1e-3_maskseed7_noiseseed9007",
+                        True,
+                    ),
+                ),
+            )
+            for shift_key, shift_label in (("t1_to_t2", "T1→T2"), ("t1_to_post", "T1→POST"))
+        ),
+    )
+
+
 SELECTED_SAMPLE_OVERRIDES: dict[str, str] = {
     "t1_to_flair": "fastmri_brain:file_brain_AXFLAIR_200_6002560:slice0006",
     "t2_to_flair": "fastmri_brain:file_brain_AXFLAIR_200_6002584:slice0010",
@@ -295,9 +391,10 @@ SELECTED_SAMPLE_OVERRIDES: dict[str, str] = {
 
 ZOOM_ROIS: dict[str, tuple[int, int, int, int]] = {
     "pre_to_post": (145, 55, 55, 40),
-    "t1_to_flair": (182, 120, 62, 44),
+    "t1_to_flair": (184, 121, 58, 42),
     "t2_to_flair": (112, 92, 58, 42),
-    "t1_to_post": (145, 55, 55, 40),
+    "t1_to_t2": (125, 185, 58, 42),
+    "t1_to_post": (144, 54, 58, 42),
     "t2_to_post": (145, 55, 55, 40),
 }
 
@@ -505,6 +602,14 @@ def clamp_roi(roi: tuple[int, int, int, int], image_shape: tuple[int, int]) -> t
     return x0, y0, width, height
 
 
+def vertically_flipped_roi(
+    roi: tuple[int, int, int, int], image_shape: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """Transform an ROI defined before a vertical image flip."""
+    x0, y0, width, height = clamp_roi(roi, image_shape)
+    return x0, image_shape[0] - y0 - height, width, height
+
+
 def add_zoom_box(
     ax: plt.Axes,
     image: np.ndarray,
@@ -558,8 +663,12 @@ def plot_shift(shift: ShiftSpec, selection: dict[str, object], output_dir: Path,
     vmax = max(vmax, 1.0e-6)
     display_images = [np.clip(image / vmax, 0, 1) for image in cropped]
     errors = [np.abs(image - gt_crop) / vmax for image in cropped[:-1]]
+    display_images = [np.flipud(image) for image in display_images]
+    errors = [np.flipud(error) for error in errors]
     error_vmax = 0.5
     zoom_roi = ZOOM_ROIS.get(shift.key)
+    if zoom_roi is not None:
+        zoom_roi = vertically_flipped_roi(zoom_roi, gt_crop.shape)
 
     ncols = len(labels)
     fig, axes = plt.subplots(
@@ -588,13 +697,13 @@ def plot_shift(shift: ShiftSpec, selection: dict[str, object], output_dir: Path,
             if zoom_roi is not None:
                 add_zoom_box(axes[1, col], err, zoom_roi, cmap="jet", vmin=0, vmax=error_vmax)
         else:
-            error_mappable = axes[1, col].imshow(np.zeros_like(gt_crop), cmap="jet", vmin=0, vmax=error_vmax)
+            axes[1, col].set_facecolor("white")
         axes[1, col].axis("off")
     if error_mappable is not None:
-        cbar = fig.colorbar(error_mappable, ax=axes[1, -1], fraction=0.046, pad=0.02)
+        cax = axes[1, -1].inset_axes([0.46, 0.14, 0.08, 0.72])
+        cbar = fig.colorbar(error_mappable, cax=cax)
         cbar.set_ticks([0.0, 0.25, 0.5])
         cbar.ax.tick_params(labelsize=7)
-        cbar.set_label("Error", fontsize=8)
     axes[0, 0].text(
         -0.09,
         0.5,
@@ -636,6 +745,120 @@ def plot_shift(shift: ShiftSpec, selection: dict[str, object], output_dir: Path,
     return out_path
 
 
+def plot_combined_reconstructions(
+    shifts: tuple[ShiftSpec, ...],
+    selections: dict[str, dict[str, object]],
+    output_dir: Path,
+    *,
+    dpi: int,
+) -> Path:
+    """Render reconstruction and jet error-map rows for each Table 1 shift."""
+    if not shifts:
+        raise ValueError("At least one shift is required for the combined figure")
+    method_labels = [method.label for method in shifts[0].methods]
+    if any([method.label for method in shift.methods] != method_labels for shift in shifts[1:]):
+        raise ValueError("All combined-figure shifts must use identical method columns")
+    labels = [*method_labels, "Ground truth"]
+
+    fig, axes = plt.subplots(
+        2 * len(shifts),
+        len(labels),
+        figsize=(2.35 * len(labels), 4.25 * len(shifts)),
+        squeeze=False,
+        gridspec_kw={"wspace": 0.018, "hspace": 0.035},
+    )
+    metadata: list[dict[str, object]] = []
+    error_vmax = 0.5
+    for shift_index, shift in enumerate(shifts):
+        recon_row = 2 * shift_index
+        error_row = recon_row + 1
+        selection = selections[shift.key]
+        rows = selection["rows"]
+        images: list[np.ndarray] = []
+        target: np.ndarray | None = None
+        for method_spec in shift.methods:
+            recon, target = load_recon(rows[method_spec.key], method_spec)
+            images.append(recon)
+        if target is None:
+            raise RuntimeError(f"No target loaded for {shift.key}")
+
+        cropped, crop = foreground_crop([*images, target], target)
+        target_crop = cropped[-1]
+        vmax = max(float(np.percentile(target_crop, 99.5)), 1.0e-6)
+        display_images = [np.clip(image / vmax, 0, 1) for image in cropped]
+        error_images = [np.abs(image - target_crop) / vmax for image in cropped[:-1]]
+        error_images.append(np.zeros_like(target_crop))
+        display_images = [np.flipud(image) for image in display_images]
+        error_images = [np.flipud(error) for error in error_images]
+        zoom_roi = ZOOM_ROIS.get(shift.key)
+        if zoom_roi is not None:
+            zoom_roi = vertically_flipped_roi(zoom_roi, target_crop.shape)
+        for col_index, (image, error) in enumerate(zip(display_images, error_images)):
+            recon_ax = axes[recon_row, col_index]
+            recon_ax.imshow(image, cmap="gray", vmin=0, vmax=1)
+            if zoom_roi is not None:
+                add_zoom_box(recon_ax, image, zoom_roi, cmap="gray", vmin=0, vmax=1)
+            recon_ax.axis("off")
+            if shift_index == 0:
+                recon_ax.set_title(labels[col_index], fontsize=12, pad=7)
+
+            error_ax = axes[error_row, col_index]
+            if col_index < len(labels) - 1:
+                error_mappable = error_ax.imshow(error, cmap="jet", vmin=0, vmax=error_vmax)
+                if zoom_roi is not None:
+                    add_zoom_box(error_ax, error, zoom_roi, cmap="jet", vmin=0, vmax=error_vmax)
+            else:
+                error_ax.set_facecolor("white")
+                cax = error_ax.inset_axes([0.46, 0.14, 0.08, 0.72])
+                colorbar = fig.colorbar(error_mappable, cax=cax)
+                colorbar.set_ticks([0.0, 0.25, 0.5])
+                colorbar.ax.tick_params(labelsize=7)
+            error_ax.axis("off")
+        axes[recon_row, 0].text(
+            -0.075,
+            0.5,
+            f"{shift.label}\nRecon",
+            transform=axes[recon_row, 0].transAxes,
+            ha="right",
+            va="center",
+            rotation=90,
+            fontsize=12,
+            fontweight="semibold",
+        )
+        axes[error_row, 0].text(
+            -0.075,
+            0.5,
+            "Error",
+            transform=axes[error_row, 0].transAxes,
+            ha="right",
+            va="center",
+            rotation=90,
+            fontsize=12,
+            fontweight="semibold",
+        )
+        metadata.append(
+            {
+                "shift": shift.key,
+                "label": shift.label,
+                "sample_id": selection["sample_id"],
+                "score": selection["score"],
+                "crop_y0_y1_x0_x1": crop,
+                "zoom_roi_x0_y0_width_height": zoom_roi,
+                "error_colormap": "jet",
+                "error_vmin_vmax": [0.0, error_vmax],
+            }
+        )
+
+    out_path = output_dir / "table1_qualitative_comparison.png"
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", pad_inches=0.04)
+    fig.savefig(output_dir / "table1_qualitative_comparison.pdf", bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+    (output_dir / "table1_qualitative_selected_samples.json").write_text(
+        json.dumps(metadata, indent=2), encoding="utf-8"
+    )
+    return out_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -653,7 +876,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--comparison-set",
-        choices=("modality_matrix", "other_modality"),
+        choices=("modality_matrix", "other_modality", "table1"),
         default="modality_matrix",
         help="Which predefined comparison group to render.",
     )
@@ -669,7 +892,9 @@ def main() -> None:
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    if args.comparison_set == "other_modality":
+    if args.comparison_set == "table1":
+        shifts = make_table1_shifts(args.result_noise_tag)
+    elif args.comparison_set == "other_modality":
         shifts = make_other_modality_shifts(args.result_noise_tag)
     else:
         shifts = make_shifts(args.result_noise_tag)
@@ -685,9 +910,13 @@ def main() -> None:
 
     table = build_tables(shifts, output_dir)
     figure_paths = []
+    selections: dict[str, dict[str, object]] = {}
     for shift in shifts:
         selection = choose_sample(shift, sample_overrides)
+        selections[shift.key] = selection
         figure_paths.append(plot_shift(shift, selection, output_dir, dpi=args.dpi))
+    if args.comparison_set == "table1":
+        figure_paths.append(plot_combined_reconstructions(shifts, selections, output_dir, dpi=args.dpi))
 
     print(f"Wrote table rows: {len(table)}")
     print(f"Output dir: {output_dir}")

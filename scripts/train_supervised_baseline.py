@@ -405,7 +405,11 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
 
     config = vars(args).copy()
     config["device"] = str(device)
-    config["training_objective"] = "normalized_l1_supervised_plus_measured_kspace_self_supervision"
+    config["training_objective"] = (
+        "normalized_l1_supervised_plus_measured_kspace_self_supervision"
+        if args.self_loss
+        else "normalized_l1_supervised"
+    )
     config["uses_shift_manifest"] = bool(_using_shift_manifest(args))
     config["train_dataset_len"] = len(train_dataset)
     config["val_dataset_len"] = len(val_dataset)
